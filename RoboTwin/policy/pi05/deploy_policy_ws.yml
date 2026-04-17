@@ -1,0 +1,17 @@
+# Websocket evaluation config (keeps the same interface as deploy_policy.yml)
+policy_name: pi05_ws
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Kept for compatibility with existing override patterns.
+train_config_name: null
+model_name: null
+checkpoint_id: 30000
+pi0_step: 50
+
+# Remote openpi websocket policy server.
+ws_host: 127.0.0.1
+ws_port: 8000
