@@ -32,4 +32,3 @@ class ChunkSample:
     done_reason: str | None = None
     policy_version: int = 0
     step_id: int = 0
-

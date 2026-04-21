@@ -37,6 +37,8 @@ class Pi0FastOnlineRLConfig:
     total_updates: int = 1000
     normalize_advantages: bool = True
     seed: int = 0
+    explored_chunk_weight: float = 1.0
+    non_explored_chunk_weight: float = 1.0
 
 
 @struct.dataclass
@@ -46,6 +48,7 @@ class _ActorBatch:
     action_token_mask: jnp.ndarray
     old_token_logprobs: jnp.ndarray
     chunk_advantages: jnp.ndarray
+    chunk_weights: jnp.ndarray
 
 
 @struct.dataclass
@@ -226,6 +229,15 @@ class Pi0FastOnlineTrainer:
                 np.stack([sample.old_token_logprobs for sample in samples], axis=0), dtype=jnp.float32
             ),
             chunk_advantages=jnp.asarray([float(sample.advantage or 0.0) for sample in samples], dtype=jnp.float32),
+            chunk_weights=jnp.asarray(
+                [
+                    float(self._cfg.explored_chunk_weight)
+                    if bool(sample.exploration_applied)
+                    else float(self._cfg.non_explored_chunk_weight)
+                    for sample in samples
+                ],
+                dtype=jnp.float32,
+            ),
         )
 
     def _build_value_batch(self, samples: list[ChunkSample]) -> _ValueBatch:
@@ -250,6 +262,8 @@ class Pi0FastOnlineTrainer:
             )
             new_logprobs = stats["token_logprobs"]
             token_mask = batch.action_token_mask.astype(jnp.float32)
+            chunk_weights = jnp.maximum(batch.chunk_weights, 0.0)
+            token_weights = token_mask * chunk_weights[:, None]
             token_advantages = jnp.where(batch.action_token_mask, batch.chunk_advantages[:, None], 0.0)
             log_ratio = new_logprobs - batch.old_token_logprobs
             ratio = jnp.exp(log_ratio)
@@ -257,12 +271,12 @@ class Pi0FastOnlineTrainer:
             pg_loss_unclipped = -ratio * token_advantages
             pg_loss_clipped = -clipped_ratio * token_advantages
             actor_loss_per_token = jnp.maximum(pg_loss_unclipped, pg_loss_clipped)
-            denom = jnp.maximum(jnp.sum(token_mask), 1.0)
-            actor_loss = jnp.sum(actor_loss_per_token * token_mask) / denom
-            entropy = jnp.sum(stats["token_entropy"] * token_mask) / denom
+            denom = jnp.maximum(jnp.sum(token_weights), 1.0)
+            actor_loss = jnp.sum(actor_loss_per_token * token_weights) / denom
+            entropy = jnp.sum(stats["token_entropy"] * token_weights) / denom
             total_loss = actor_loss - cfg.entropy_coef * entropy
-            approx_kl = jnp.sum((batch.old_token_logprobs - new_logprobs) * token_mask) / denom
-            clip_fraction = jnp.sum((jnp.abs(ratio - 1.0) > cfg.clip_eps) * token_mask) / denom
+            approx_kl = jnp.sum((batch.old_token_logprobs - new_logprobs) * token_weights) / denom
+            clip_fraction = jnp.sum((jnp.abs(ratio - 1.0) > cfg.clip_eps) * token_weights) / denom
             return total_loss, {
                 "actor_loss": actor_loss,
                 "entropy": entropy,

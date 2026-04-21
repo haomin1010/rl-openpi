@@ -207,6 +207,12 @@ bash eval.sh beat_block_hammer demo_clean pi0_fast_aloha_robotwin_full beat_bloc
 
 ## 12. websokcet eval
 
-- CUDA_VISIBLE_DEVICES=2 uv run scripts/serve_policy.py --port 8000 policy:checkpoint   --policy.config=pi0_fast_aloha_robotwin_full   --policy.dir=checkpoints/pi0_fast_aloha_robotwin_full/beat_block_hammer_pi0fast_full/10000/
+- CUDA_VISIBLE_DEVICES=2 uv run scripts/serve_policy.py --port 8000 policy:checkpoint   --policy.config=pi0_fast_aloha_robotwin_full   --policy.dir=checkpoints/pi0_fast_aloha_robotwin_full/beat_block_hammer_pi0fast_full/30000/
 
 - bash eval_ws.sh beat_block_hammer demo_clean pi0_fast_aloha_robotwin_full beat_block_hammer_pi0fast_full 0 4 127.0.0.1 8000
+
+## 13. ppo训练
+### 1. 收集数据
+-- uv run python scripts/serve_robotwin_env_ws.py   --task_name beat_block_hammer   --task_config demo_clean   --instruction_type unseen   --port 8765   --save_lerobot   --lerobot_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_online_run1   --lerobot_repo_id lerobot-hammer-online   --lerobot_fps 50   --lerobot_overwrite
+
+-- uv run python scripts/train_pi0_fast_online_v2.py   --policy.path checkpoints/pi0_fast_aloha_robotwin_full/beat_block_hammer_pi0fast_full/10000/   --policy.config pi0_fast_aloha_robotwin_ppo   --env.ws_url ws://127.0.0.1:8765   --total_updates 1   --rollout_batch_size 1024   --mini_batch_size 32   --ppo_epochs 0   --value_epochs 0

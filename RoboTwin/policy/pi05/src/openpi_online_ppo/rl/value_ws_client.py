@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+from typing import Any
+
+import websockets.sync.client
+
+from openpi_client import msgpack_numpy
+
+
+class ValueWebsocketClient:
+    """Sync websocket client for remote value service."""
+
+    def __init__(self, ws_url: str):
+        self._packer = msgpack_numpy.Packer()
+        self._conn = websockets.sync.client.connect(
+            ws_url,
+            compression=None,
+            max_size=None,
+        )
+        self._try_drain_handshake()
+
+    def _try_drain_handshake(self) -> None:
+        try:
+            self._conn.recv(timeout=0.05)
+        except Exception:
+            pass
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._conn.send(self._packer.pack(payload))
+        resp = self._conn.recv()
+        if isinstance(resp, str):
+            raise RuntimeError(f"value ws server error: {resp}")
+        data = msgpack_numpy.unpackb(resp)
+        if not isinstance(data, dict):
+            raise TypeError(f"Unexpected value ws response type: {type(data)}")
+        return data
+
+    def predict(self, transformed_obs: dict[str, Any]) -> float:
+        resp = self._request({"cmd": "predict", "observation": transformed_obs})
+        return float(resp["value"])
+
+    def predict_keyframe(self, transformed_obs: dict[str, Any]) -> float:
+        resp = self._request({"cmd": "predict_keyframe", "observation": transformed_obs})
+        return float(resp["keyframe_prob"])
+
+    def sync_params_from_file(self, params_file: str) -> None:
+        self._request({"cmd": "sync_params_from_file", "params_file": params_file})
+
+    def save_state_to_file(self, state_file: str, *, include_optimizer_state: bool = True) -> str:
+        resp = self._request(
+            {
+                "cmd": "save_state_to_file",
+                "state_file": state_file,
+                "include_optimizer_state": bool(include_optimizer_state),
+            }
+        )
+        return str(resp.get("state_file", state_file))
+
+    def load_state_from_file(self, state_file: str, *, load_optimizer_state: bool = True) -> None:
+        self._request(
+            {
+                "cmd": "load_state_from_file",
+                "state_file": state_file,
+                "load_optimizer_state": bool(load_optimizer_state),
+            }
+        )
+
+    def train_mc_from_lerobot(self, *, dataset_root: str, repo_id: str) -> dict[str, float]:
+        resp = self._request(
+            {
+                "cmd": "train_mc_from_lerobot",
+                "dataset_root": dataset_root,
+                "repo_id": repo_id,
+            }
+        )
+        metrics = resp.get("metrics", {})
+        if not isinstance(metrics, dict):
+            return {}
+        return {str(k): float(v) for k, v in metrics.items()}
+
+    def train_keyframe_from_lerobot(
+        self,
+        *,
+        dataset_root: str,
+        repo_id: str,
+        annotations_json: str,
+    ) -> dict[str, float]:
+        resp = self._request(
+            {
+                "cmd": "train_keyframe_from_lerobot",
+                "dataset_root": dataset_root,
+                "repo_id": repo_id,
+                "annotations_json": annotations_json,
+            }
+        )
+        metrics = resp.get("metrics", {})
+        if not isinstance(metrics, dict):
+            return {}
+        return {str(k): float(v) for k, v in metrics.items()}
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass

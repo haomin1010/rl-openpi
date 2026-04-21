@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from typing import Protocol
 
 import numpy as np
 
@@ -14,9 +15,14 @@ from openpi_online_ppo.rl.reward_value import ChunkRewardValueProvider
 @dataclass
 class _EnvState:
     obs: dict[str, Any]
+    transformed_obs: dict[str, Any]
     task: str | None
     value: float
     step_id: int = 0
+
+
+class ValuePredictor(Protocol):
+    def predict(self, transformed_obs: dict[str, Any]) -> float: ...
 
 
 class Pi0FastChunkCollector:
@@ -28,11 +34,19 @@ class Pi0FastChunkCollector:
         env: SingleEnvWebsocketEnv,
         policy: Pi0FastRLPolicy,
         provider: ChunkRewardValueProvider,
+        value_predictor: ValuePredictor | None = None,
     ) -> None:
         self._env = env
         self._policy = policy
         self._provider = provider
+        self._value_predictor = value_predictor
         self._state: _EnvState | None = None
+
+    def _predict_value(self, obs: dict[str, Any], transformed_obs: dict[str, Any] | None = None) -> float:
+        if self._value_predictor is None:
+            return self._policy.predict_value(obs)
+        transformed_obs = transformed_obs if transformed_obs is not None else self._policy.transform_observation(obs)
+        return float(self._value_predictor.predict(transformed_obs))
 
     def reset(self) -> None:
         obs = self._env.reset()
@@ -40,8 +54,9 @@ class Pi0FastChunkCollector:
         if task is None:
             task = ""
             obs["prompt"] = task
-        value = self._policy.predict_value(obs)
-        self._state = _EnvState(obs=obs, task=str(task), value=value, step_id=0)
+        transformed = self._policy.transform_observation(obs)
+        value = self._predict_value(obs, transformed)
+        self._state = _EnvState(obs=obs, transformed_obs=transformed, task=str(task), value=value, step_id=0)
 
     def collect_chunk_batch(self, *, policy_version: int) -> list[ChunkSample]:
         if self._state is None:
@@ -62,7 +77,8 @@ class Pi0FastChunkCollector:
             metadata={"env_info": info, "env_reward": env_reward},
         )
         reward = float(provider_result["reward"])
-        next_value = self._policy.predict_value(next_obs)
+        next_transformed_obs = self._policy.transform_observation(next_obs)
+        next_value = self._predict_value(next_obs, next_transformed_obs)
 
         sample = ChunkSample(
             obs_t=state.obs,
@@ -93,9 +109,21 @@ class Pi0FastChunkCollector:
             obs = self._env.reset()
             task2 = str(obs.get("prompt", ""))
             obs["prompt"] = task2
-            self._state = _EnvState(obs=obs, task=task2, value=self._policy.predict_value(obs), step_id=0)
+            transformed = self._policy.transform_observation(obs)
+            self._state = _EnvState(
+                obs=obs,
+                transformed_obs=transformed,
+                task=task2,
+                value=self._predict_value(obs, transformed),
+                step_id=0,
+            )
         else:
-            self._state = _EnvState(obs=next_obs, task=str(task), value=next_value, step_id=state.step_id + 1)
+            self._state = _EnvState(
+                obs=next_obs,
+                transformed_obs=next_transformed_obs,
+                task=str(task),
+                value=next_value,
+                step_id=state.step_id + 1,
+            )
 
         return [sample]
-

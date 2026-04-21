@@ -96,6 +96,8 @@ class Pi0FASTConfig(_model.BaseModelConfig):
     value_hidden_dim: int | None = None
     use_keyframe_head: bool = False
     keyframe_hidden_dim: int | None = None
+    # If None, defaults to action_horizon // 2 bins.
+    keyframe_num_bins: int | None = None
 
     @property
     @override
@@ -165,6 +167,9 @@ class Pi0FAST(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        # Learnable CLS token generator for value / keyframe:
+        # pass fixed one-hot [2] through a trainable linear layer.
+        self.aux_cls_embed = nnx.Linear(2, paligemma_config.width, use_bias=False, rngs=rngs)
         self.value_head = None
         if config.use_value_head:
             hidden_dim = int(config.value_hidden_dim or paligemma_config.width)
@@ -175,9 +180,10 @@ class Pi0FAST(_model.BaseModel):
         self.keyframe_head = None
         if config.use_keyframe_head:
             hidden_dim = int(config.keyframe_hidden_dim or paligemma_config.width)
+            keyframe_num_bins = int(config.keyframe_num_bins or max(2, config.action_horizon // 2))
             self.keyframe_head = nnx.Dict(
                 proj_in=nnx.Linear(paligemma_config.width, hidden_dim, rngs=rngs),
-                proj_out=nnx.Linear(hidden_dim, 1, rngs=rngs),
+                proj_out=nnx.Linear(hidden_dim, keyframe_num_bins, rngs=rngs),
             )
 
     @at.typecheck
@@ -286,23 +292,34 @@ class Pi0FAST(_model.BaseModel):
         attn_mask = make_attn_mask(input_mask, ar_mask)
         return input_token_embeddings, input_mask, ar_mask, attn_mask
 
-    def _extract_value_features(
+    def _extract_aux_features(
         self,
         observation: _model.Observation,
         *,
         stop_gradient: bool = False,
-    ) -> at.Float[at.Array, "b emb"]:
-        input_token_embeddings, input_mask, _, attn_mask = self._prefix_forward(observation)
+    ) -> tuple[at.Float[at.Array, "b emb"], at.Float[at.Array, "b emb"]]:
+        input_token_embeddings, input_mask, ar_mask, _ = self._prefix_forward(observation)
+        bsize = input_token_embeddings.shape[0]
+        aux_onehot = jnp.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=input_token_embeddings.dtype)
+        aux_emb = self.aux_cls_embed(aux_onehot)  # [2, emb]
+        aux_emb = jnp.broadcast_to(aux_emb[None, :, :], (bsize, aux_emb.shape[0], aux_emb.shape[1]))
+        aux_mask = jnp.ones((bsize, 2), dtype=input_mask.dtype)
+        aux_ar = jnp.zeros((bsize, 2), dtype=ar_mask.dtype)
+        input_token_embeddings = jnp.concatenate([input_token_embeddings, aux_emb], axis=1)
+        input_mask = jnp.concatenate([input_mask, aux_mask], axis=1)
+        ar_mask = jnp.concatenate([ar_mask, aux_ar], axis=1)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
         pre_logits, _, _ = self.PaliGemma.llm(
             embedded_prefix=input_token_embeddings,
             mask=attn_mask,
             return_prelogits=True,
         )
-        feature_mask = input_mask.astype(pre_logits.dtype)[..., None]
-        pooled = jnp.sum(pre_logits * feature_mask, axis=1) / jnp.clip(jnp.sum(feature_mask, axis=1), 1.0)
+        value_cls = pre_logits[:, -2, :]
+        keyframe_cls = pre_logits[:, -1, :]
         if stop_gradient:
-            pooled = jax.lax.stop_gradient(pooled)
-        return pooled
+            value_cls = jax.lax.stop_gradient(value_cls)
+            keyframe_cls = jax.lax.stop_gradient(keyframe_cls)
+        return value_cls, keyframe_cls
 
     def predict_value_logits(
         self,
@@ -312,8 +329,8 @@ class Pi0FAST(_model.BaseModel):
     ) -> at.Float[at.Array, "b bins"]:
         if self.value_head is None:
             raise ValueError("Value head is not enabled for this Pi0FAST model.")
-        features = self._extract_value_features(observation, stop_gradient=stop_gradient)
-        hidden = self.value_head.proj_in(features)
+        value_features, _ = self._extract_aux_features(observation, stop_gradient=stop_gradient)
+        hidden = self.value_head.proj_in(value_features)
         hidden = jax.nn.gelu(hidden)
         return self.value_head.proj_out(hidden)
 
@@ -333,13 +350,13 @@ class Pi0FAST(_model.BaseModel):
         observation: _model.Observation,
         *,
         stop_gradient: bool = False,
-    ) -> at.Float[at.Array, "b"]:
+    ) -> at.Float[at.Array, "b bins"]:
         if self.keyframe_head is None:
             raise ValueError("Keyframe head is not enabled for this Pi0FAST model.")
-        features = self._extract_value_features(observation, stop_gradient=stop_gradient)
-        hidden = self.keyframe_head.proj_in(features)
+        _, keyframe_features = self._extract_aux_features(observation, stop_gradient=stop_gradient)
+        hidden = self.keyframe_head.proj_in(keyframe_features)
         hidden = jax.nn.gelu(hidden)
-        return self.keyframe_head.proj_out(hidden)[..., 0]
+        return self.keyframe_head.proj_out(hidden)
 
     def predict_keyframe_prob(
         self,
@@ -347,7 +364,14 @@ class Pi0FAST(_model.BaseModel):
         *,
         stop_gradient: bool = False,
     ) -> at.Float[at.Array, "b"]:
-        return jax.nn.sigmoid(self.predict_keyframe_logits(observation, stop_gradient=stop_gradient))
+        logits = self.predict_keyframe_logits(observation, stop_gradient=stop_gradient)
+        probs = jax.nn.softmax(logits, axis=-1)
+        num_bins = logits.shape[-1]
+        # Map distance bins to [0,1] closeness score.
+        dist = jnp.arange(num_bins, dtype=probs.dtype)
+        denom = jnp.maximum(jnp.asarray(num_bins - 1, dtype=probs.dtype), 1.0)
+        closeness = 1.0 - dist / denom
+        return jnp.sum(probs * closeness[None, :], axis=-1)
 
     def value_bin_centers(self) -> at.Float[at.Array, "bins"]:
         config = self.config

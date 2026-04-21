@@ -4,6 +4,7 @@ from collections.abc import Sequence
 import os
 import pathlib
 from typing import Any
+from typing import Callable
 
 import flax.nnx as nnx
 import jax
@@ -52,6 +53,7 @@ class Pi0FastRLPolicy:
         sample_kwargs: dict[str, Any] | None = None,
         exploration_config: KeyframeExplorationConfig | None = None,
         dct_noise_fn: DCTNoiseFn | None = None,
+        keyframe_prob_fn: Callable[[dict[str, Any]], float] | None = None,
     ) -> None:
         self._model = model
         self._train_config = train_config
@@ -60,6 +62,7 @@ class Pi0FastRLPolicy:
         self._sample_kwargs = sample_kwargs or {}
         self._exploration_cfg = exploration_config or KeyframeExplorationConfig()
         self._dct_noise_fn = dct_noise_fn
+        self._keyframe_prob_fn = keyframe_prob_fn
         self._fast_tokenizer, self._action_horizon, self._action_dim, post_extract_transforms = (
             _extract_fast_output_tokenizer(output_transforms)
         )
@@ -84,6 +87,17 @@ class Pi0FastRLPolicy:
         batched = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], transformed)
         return _model.Observation.from_dict(batched), transformed
 
+    @staticmethod
+    def _truncate_by_mask(tokens: np.ndarray, token_mask: np.ndarray | None) -> np.ndarray:
+        toks = np.asarray(tokens, dtype=np.int32).reshape(-1)
+        if token_mask is None:
+            return toks
+        mask = np.asarray(token_mask, dtype=bool).reshape(-1)
+        if mask.shape[0] != toks.shape[0]:
+            raise ValueError(f"token/mask length mismatch: {toks.shape[0]} vs {mask.shape[0]}")
+        valid = toks[mask]
+        return valid if valid.size > 0 else toks[:0]
+
     def sample_chunk(self, obs: dict[str, Any]) -> dict[str, Any]:
         observation, transformed = self._prepare_observation(obs)
         self._rng, sample_rng = jax.random.split(self._rng)
@@ -91,9 +105,13 @@ class Pi0FastRLPolicy:
 
         sampled_action_tokens = np.asarray(trace["tokens"][0], dtype=np.int32)
         sampled_action_token_mask = np.asarray(trace["token_mask"][0], dtype=bool)
-        keyframe_prob = self.predict_keyframe_prob(obs) if getattr(self._model, "keyframe_head", None) is not None else 0.0
+        sampled_valid_tokens = self._truncate_by_mask(sampled_action_tokens, sampled_action_token_mask)
+        if self._keyframe_prob_fn is not None:
+            keyframe_prob = float(self._keyframe_prob_fn(obs))
+        else:
+            keyframe_prob = self.predict_keyframe_prob(obs) if getattr(self._model, "keyframe_head", None) is not None else 0.0
         dct_coeffs = self._fast_tokenizer.extract_action_dct_coeffs(
-            sampled_action_tokens,
+            sampled_valid_tokens,
             action_horizon=self._action_horizon,
             action_dim=self._action_dim,
             relaxed_decoding=self._exploration_cfg.relaxed_fast_decoding,
@@ -104,18 +122,20 @@ class Pi0FastRLPolicy:
             keyframe_prob=keyframe_prob,
             noise_fn=self._dct_noise_fn,
             obs=obs,
-            metadata={"sampled_action_tokens": sampled_action_tokens},
+            metadata={
+                "sampled_action_tokens": sampled_action_tokens,
+                "decode_dct_to_actions": self._fast_tokenizer.decode_action_dct_coeffs,
+                "encode_actions_to_dct": self._fast_tokenizer.encode_action_dct_coeffs,
+            },
         )
-        executed_action_tokens_unpadded = self._fast_tokenizer.encode_action_dct_coeffs(explored_dct_coeffs)
+        executed_action_tokens_action_only = self._fast_tokenizer.encode_action_dct_coeffs(explored_dct_coeffs)
+        executed_action_tokens_unpadded = self._fast_tokenizer.format_action_tokens_as_output(
+            executed_action_tokens_action_only,
+            add_eos=True,
+        )
         executed_action_tokens, executed_action_token_mask = self._pad_token_sequence(
             executed_action_tokens_unpadded,
             sampled_action_tokens.shape[0],
-        )
-        executed_dct_coeffs = self._fast_tokenizer.extract_action_dct_coeffs(
-            executed_action_tokens,
-            action_horizon=self._action_horizon,
-            action_dim=self._action_dim,
-            relaxed_decoding=self._exploration_cfg.relaxed_fast_decoding,
         )
         old_token_stats = self._model.recompute_action_logprobs(
             observation,
@@ -123,11 +143,12 @@ class Pi0FastRLPolicy:
             action_token_mask=jnp.asarray(executed_action_token_mask, dtype=jnp.bool_)[np.newaxis, ...],
         )
         old_token_logprobs = np.asarray(old_token_stats["token_logprobs"][0], dtype=np.float32)
-        decoded_actions = self._fast_tokenizer.decode_action_dct_coeffs(executed_dct_coeffs)
+        decoded_actions = self._fast_tokenizer.decode_action_dct_coeffs(explored_dct_coeffs)
+        decoded_actions = np.asarray(decoded_actions, dtype=np.float32)
         outputs = self._post_extract_output_transform(
             {
                 "state": np.asarray(transformed["state"]),
-                "actions": np.asarray(decoded_actions, dtype=np.float32),
+                "actions": decoded_actions,
             }
         )
         action_chunk = np.asarray(outputs["actions"], dtype=np.float32)
@@ -140,7 +161,7 @@ class Pi0FastRLPolicy:
             "sampled_action_tokens": sampled_action_tokens,
             "sampled_action_token_mask": sampled_action_token_mask,
             "sampled_dct_coeffs": np.asarray(dct_coeffs, dtype=np.float32),
-            "dct_coeffs": np.asarray(executed_dct_coeffs, dtype=np.float32),
+            "dct_coeffs": np.asarray(explored_dct_coeffs, dtype=np.float32),
             "keyframe_prob": float(keyframe_prob),
             "exploration_applied": bool(exploration_applied),
             "transformed_obs": transformed,
@@ -150,6 +171,11 @@ class Pi0FastRLPolicy:
         observation, _ = self._prepare_observation(obs)
         value = self._model.predict_value(observation)[0]
         return float(np.asarray(value))
+
+    def transform_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
+        """Apply policy input transforms and return unbatched model-ready observation dict."""
+        _, transformed = self._prepare_observation(obs)
+        return transformed
 
     def predict_keyframe_prob(self, obs: dict[str, Any]) -> float:
         observation, _ = self._prepare_observation(obs)
@@ -200,6 +226,7 @@ def create_trained_pi0_fast_rl_policy(
     norm_stats: dict[str, _transforms.NormStats] | None = None,
     exploration_config: KeyframeExplorationConfig | None = None,
     dct_noise_fn: DCTNoiseFn | None = None,
+    keyframe_prob_fn: Callable[[dict[str, Any]], float] | None = None,
 ) -> Pi0FastRLPolicy:
     repack_transforms = repack_transforms or _transforms.Group()
     checkpoint_dir = _download.maybe_download(str(checkpoint_dir))
@@ -247,4 +274,5 @@ def create_trained_pi0_fast_rl_policy(
         sample_kwargs=sample_kwargs,
         exploration_config=exploration_config,
         dct_noise_fn=dct_noise_fn,
+        keyframe_prob_fn=keyframe_prob_fn,
     )

@@ -4,6 +4,7 @@ import os
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
+from scipy.fft import idct
 import sentencepiece
 from transformers import AutoProcessor
 
@@ -60,6 +61,11 @@ class FASTTokenizer:
         # Instantiate FAST tokenizer
         self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+        self._action_prefix_tokens = np.asarray(self._paligemma_tokenizer.encode("Action: "), dtype=np.int32)
+        bar_tokens = self._paligemma_tokenizer.encode("|", add_eos=False)
+        if len(bar_tokens) == 0:
+            raise ValueError("Failed to tokenize '|' separator for FAST action parsing.")
+        self._action_sep_token = int(bar_tokens[0])
 
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None
@@ -117,23 +123,151 @@ class FASTTokenizer:
         return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
 
     def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
-        # Decode predicted output tokens
-        decoded_tokens = self._paligemma_tokenizer.decode(tokens.tolist())
+        dct_coeffs = self.extract_action_dct_coeffs(
+            tokens,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            relaxed_decoding=True,
+        )
+        return self.decode_action_dct_coeffs(dct_coeffs)
 
-        # Extract actions from FAST model outputs
-        if "Action: " not in decoded_tokens:
+    def extract_action_dct_coeffs(
+        self,
+        tokens: np.ndarray,
+        *,
+        action_horizon: int,
+        action_dim: int,
+        relaxed_decoding: bool = True,
+    ) -> np.ndarray:
+        action_tokens_in_pg = self.extract_action_tokens(tokens)
+        return self.decode_action_tokens_to_dct_coeffs(
+            action_tokens_in_pg,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            relaxed_decoding=relaxed_decoding,
+        )
+
+    def extract_action_tokens(self, tokens: np.ndarray) -> np.ndarray:
+        toks = np.asarray(tokens, dtype=np.int32).reshape(-1)
+        n = toks.shape[0]
+        prefix = self._action_prefix_tokens
+        m = prefix.shape[0]
+        if n < m:
+            return np.asarray([], dtype=np.int32)
+
+        start = -1
+        for i in range(0, n - m + 1):
+            if np.array_equal(toks[i : i + m], prefix):
+                start = i + m
+                break
+        if start < 0:
+            return np.asarray([], dtype=np.int32)
+
+        end = n
+        for j in range(start, n):
+            if int(toks[j]) == self._action_sep_token:
+                end = j
+                break
+        if end <= start:
+            return np.asarray([], dtype=np.int32)
+        return toks[start:end].astype(np.int32, copy=False)
+
+    def decode_action_tokens_to_dct_coeffs(
+        self,
+        action_tokens_in_pg_vocab: np.ndarray,
+        *,
+        action_horizon: int,
+        action_dim: int,
+        relaxed_decoding: bool = True,
+    ) -> np.ndarray:
+        action_tokens_pg = np.asarray(action_tokens_in_pg_vocab, dtype=np.int32).reshape(-1)
+        if action_tokens_pg.size == 0:
             return np.zeros((action_horizon, action_dim), dtype=np.float32)
 
-        # Extract actions from decoded tokens
-        raw_action_tokens = np.array(
-            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
+        fast_tokens = self._pg_tokens_to_fast_tokens(action_tokens_pg)
+        try:
+            decoded_bpe = self._fast_tokenizer.bpe_tokenizer.decode(fast_tokens.tolist())
+            decoded_dct_coeff = np.array(list(map(ord, decoded_bpe)), dtype=np.float32) + float(self._fast_tokenizer.min_token)
+        except Exception as exc:
+            logging.warning(
+                "FAST BPE decode failed: %s | fast_tokens_len=%d fast_preview=%s",
+                exc,
+                int(fast_tokens.shape[0]),
+                fast_tokens[: min(32, fast_tokens.shape[0])].tolist(),
+            )
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
+
+        expected_seq_len = action_horizon * action_dim
+        diff = expected_seq_len - int(decoded_dct_coeff.shape[0])
+        if relaxed_decoding:
+            if diff < 0:
+                decoded_dct_coeff = decoded_dct_coeff[:expected_seq_len]
+            elif diff > 0:
+                decoded_dct_coeff = np.pad(decoded_dct_coeff, (0, diff), mode="constant", constant_values=0)
+        elif diff != 0:
+            raise ValueError(
+                f"Decoded DCT coefficients have length {decoded_dct_coeff.shape[0]}, expected {expected_seq_len}."
+            )
+
+        decoded_dct_coeff = decoded_dct_coeff.reshape(-1, action_dim)
+        if decoded_dct_coeff.shape != (action_horizon, action_dim):
+            raise ValueError(
+                f"Decoded DCT coefficients have shape {decoded_dct_coeff.shape}, expected ({action_horizon}, {action_dim})."
+            )
+        return decoded_dct_coeff.astype(np.float32, copy=False)
+
+    def decode_action_dct_coeffs(self, dct_coeffs: np.ndarray) -> np.ndarray:
+        coeffs = np.asarray(dct_coeffs, dtype=np.float32)
+        if coeffs.ndim != 2:
+            raise ValueError(f"Expected DCT coefficients with shape [T, D], got {coeffs.shape}.")
+        return idct(coeffs / self._fast_tokenizer.scale, axis=0, norm="ortho").astype(np.float32)
+
+    def encode_action_dct_coeffs(self, dct_coeffs: np.ndarray) -> np.ndarray:
+        coeffs = np.asarray(dct_coeffs, dtype=np.float32)
+        if coeffs.ndim != 2:
+            raise ValueError(f"Expected DCT coefficients with shape [T, D], got {coeffs.shape}.")
+        quantized = np.rint(coeffs).astype(np.int32).reshape(-1)
+        shifted = quantized - int(self._fast_tokenizer.min_token)
+        shifted = np.clip(shifted, 0, 0x10FFFF)
+        bpe_text = "".join(chr(int(v)) for v in shifted.tolist())
+        try:
+            encoded = self._fast_tokenizer.bpe_tokenizer.encode(bpe_text)
+        except Exception as exc:
+            raise ValueError(f"Failed to encode DCT coefficients with FAST tokenizer: {exc}") from exc
+        encoded_arr = np.asarray(encoded if isinstance(encoded, list) else list(encoded), dtype=np.int32)
+        return self._act_tokens_to_paligemma_tokens(encoded_arr)
+
+    def decode_action_tokens_to_actions(
+        self,
+        action_tokens_in_pg_vocab: np.ndarray,
+        *,
+        action_horizon: int,
+        action_dim: int,
+        relaxed_decoding: bool = True,
+    ) -> np.ndarray:
+        dct_coeffs = self.decode_action_tokens_to_dct_coeffs(
+            action_tokens_in_pg_vocab,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            relaxed_decoding=relaxed_decoding,
         )
-        action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
-        return self._fast_tokenizer.decode(
-            [action_tokens.tolist()], time_horizon=action_horizon, action_dim=action_dim
-        )[0]
+        return self.decode_action_dct_coeffs(dct_coeffs)
+
+    def format_action_tokens_as_output(self, action_tokens_in_pg_vocab: np.ndarray, *, add_eos: bool = True) -> np.ndarray:
+        """Wrap action tokens into the canonical FAST output format:
+        `Action: <tokens> |` (optionally with EOS after `|`).
+        """
+        action_tokens = np.asarray(action_tokens_in_pg_vocab, dtype=np.int32).reshape(-1)
+        prefix = np.asarray(self._paligemma_tokenizer.encode("Action: "), dtype=np.int32)
+        suffix = np.asarray(self._paligemma_tokenizer.encode("|", add_eos=add_eos), dtype=np.int32)
+        return np.concatenate([prefix, action_tokens, suffix], axis=0).astype(np.int32, copy=False)
 
     def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+    def _pg_tokens_to_fast_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
         if isinstance(tokens, list):
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens

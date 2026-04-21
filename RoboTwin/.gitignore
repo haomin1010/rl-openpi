@@ -1,3 +1,4 @@
+.codex/
 models/
 data/*
 !data/process_stuck.py

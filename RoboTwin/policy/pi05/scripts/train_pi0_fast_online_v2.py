@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+from typing import Any
 
 from openpi.models import pi0_fast as _base_pi0_fast
 from openpi.training import config as train_config
@@ -11,13 +12,32 @@ from openpi_online_ppo.env.single_env_ws import SingleEnvWebsocketEnv
 from openpi_online_ppo.env.single_env_ws import SingleEnvWsConfig
 from openpi_online_ppo.models import pi0_fast_rl as _rl_pi0_fast
 from openpi_online_ppo.rl.exploration import CallableDCTNoiseFn
+from openpi_online_ppo.rl.exploration import load_action_perturb_net
 from openpi_online_ppo.rl.exploration import KeyframeExplorationConfig
+from openpi_online_ppo.rl.exploration import LinearKeyframeNet
 from openpi_online_ppo.rl.exploration import default_dct_noise
 from openpi_online_ppo.rl.pi0_fast_online_trainer import Pi0FastOnlineRLConfig
 from openpi_online_ppo.rl.pi0_fast_online_trainer import Pi0FastOnlineTrainer
 from openpi_online_ppo.rl.pi0_fast_policy import create_trained_pi0_fast_rl_policy
 from openpi_online_ppo.rl.pi0_fast_rollout import Pi0FastChunkCollector
+from openpi_online_ppo.rl.reward_value import EnvChunkRewardProvider
 from openpi_online_ppo.rl.reward_value import FixedRewardProvider
+from openpi_online_ppo.rl.value_ws_client import ValueWebsocketClient
+
+
+def _parse_dim_list(raw: str | None) -> tuple[int, ...] | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s == "" or s.lower() in {"all", "none"}:
+        return None
+    out: list[int] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if tok == "":
+            continue
+        out.append(int(tok))
+    return tuple(out) if out else None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -53,10 +73,42 @@ def _parse_args() -> argparse.Namespace:
 
     # User decision: fixed reward is 0.
     p.add_argument("--fixed_reward", type=float, default=0.0)
+    p.add_argument("--reward_mode", type=str, default="env_chunk", choices=("env_chunk", "fixed"))
 
     # User decision: keyframe exploration always on.
+    p.add_argument(
+        "--explore_mode",
+        type=str,
+        default="always",
+        choices=("always", "conditional_keyframe", "never"),
+    )
+    p.add_argument("--explore_keyframe_threshold", type=float, default=0.5)
+    p.add_argument("--explore_keyframe_gate", type=str, default="model_head", choices=("model_head", "small_net", "none"))
+    p.add_argument("--explore_keyframe_net_ckpt", type=str, default=None)
     p.add_argument("--explore_dct_dims", type=int, default=4)
     p.add_argument("--explore_noise_std", type=float, default=0.01)
+    p.add_argument(
+        "--explore_perturb_backend",
+        type=str,
+        default="dct_gaussian",
+        choices=("dct_gaussian", "action_formula", "action_network", "action_hybrid"),
+    )
+    p.add_argument("--explore_action_radius_min", type=float, default=0.0)
+    p.add_argument("--explore_action_radius_max", type=float, default=0.15)
+    p.add_argument("--explore_action_abs_clip", type=float, default=1.0)
+    p.add_argument(
+        "--explore_action_noise_dims",
+        type=str,
+        default="",
+        help="Comma-separated action dim indices to perturb. Empty/all means all dims.",
+    )
+    p.add_argument("--explore_network_mix_alpha", type=float, default=0.5)
+    p.add_argument("--explore_network_ckpt", type=str, default=None)
+    p.add_argument("--explore_network_obs_dim", type=int, default=32)
+    p.add_argument("--explore_network_latent_dim", type=int, default=16)
+    p.add_argument("--explored_chunk_weight", type=float, default=1.0)
+    p.add_argument("--non_explored_chunk_weight", type=float, default=1.0)
+    p.add_argument("--value.ws_url", dest="value_ws_url", type=str, default=None)
     return p.parse_args()
 
 
@@ -75,6 +127,7 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
         fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
         use_value_head=True,
         use_keyframe_head=True,
+        keyframe_num_bins=max(2, int(base.action_horizon) // 2),
     )
     return dataclasses.replace(cfg, model=rl_model)
 
@@ -87,24 +140,78 @@ def main() -> None:
     cfg = _to_rl_train_config(cfg)
 
     exploration_cfg = KeyframeExplorationConfig(
-        always_on=True,
+        mode=str(args.explore_mode),
+        always_on=(str(args.explore_mode) != "never"),
         explore_dct_dims=max(0, int(args.explore_dct_dims)),
         relaxed_fast_decoding=True,
         noise_std=float(args.explore_noise_std),
+        keyframe_prob_threshold=float(args.explore_keyframe_threshold),
+        perturb_backend=str(args.explore_perturb_backend),
+        action_radius_min=float(args.explore_action_radius_min),
+        action_radius_max=float(args.explore_action_radius_max),
+        action_abs_clip=float(args.explore_action_abs_clip),
+        action_noise_indices=_parse_dim_list(args.explore_action_noise_dims),
+        network_mix_alpha=float(args.explore_network_mix_alpha),
+        network_checkpoint=(str(args.explore_network_ckpt) if args.explore_network_ckpt else None),
+        network_obs_dim=int(args.explore_network_obs_dim),
+        network_latent_dim=int(args.explore_network_latent_dim),
     )
-    noise_fn = CallableDCTNoiseFn(
-        lambda **kwargs: default_dct_noise(
+    perturb_net = None
+    if exploration_cfg.network_checkpoint:
+        perturb_net = load_action_perturb_net(exploration_cfg.network_checkpoint)
+
+    value_client = ValueWebsocketClient(args.value_ws_url) if args.value_ws_url else None
+    keyframe_net = None
+    keyframe_mode = "none"
+    if str(args.explore_keyframe_gate) == "small_net":
+        if args.explore_keyframe_net_ckpt:
+            keyframe_net = LinearKeyframeNet.load(args.explore_keyframe_net_ckpt)
+            keyframe_mode = "local_small_net"
+        elif value_client is not None:
+            keyframe_mode = "remote_value_ws"
+        else:
+            raise ValueError(
+                "small_net gate requires either --explore_keyframe_net_ckpt "
+                "or --value.ws_url (for remote keyframe inference)."
+            )
+    def _noise_impl(**kwargs):
+        md = dict(kwargs.get("metadata") or {})
+        if perturb_net is not None:
+            md["perturb_net"] = perturb_net
+        kwargs["metadata"] = md
+        return default_dct_noise(
             **kwargs,
             noise_std=exploration_cfg.noise_std,
+            cfg=exploration_cfg,
         )
-    )
+
+    noise_fn = CallableDCTNoiseFn(_noise_impl)
+
+    keyframe_prob_fn = None
+    policy_holder: dict[str, Any] = {}
+    if str(args.explore_keyframe_gate) == "small_net":
+        if keyframe_mode == "local_small_net":
+            keyframe_prob_fn = lambda obs: float(keyframe_net.predict_prob(obs))  # noqa: E731
+        elif keyframe_mode == "remote_value_ws":
+            def _keyframe_prob_fn_remote(obs):
+                policy_obj = policy_holder.get("policy")
+                if policy_obj is None:
+                    raise RuntimeError("policy is not initialized for remote keyframe inference")
+                transformed = policy_obj.transform_observation(obs)
+                return float(value_client.predict_keyframe(transformed))
+
+            keyframe_prob_fn = _keyframe_prob_fn_remote
+    elif str(args.explore_keyframe_gate) == "none":
+        keyframe_prob_fn = lambda obs: 0.0  # noqa: E731
 
     policy = create_trained_pi0_fast_rl_policy(
         cfg,
         args.policy_path,
         exploration_config=exploration_cfg,
         dct_noise_fn=noise_fn,
+        keyframe_prob_fn=keyframe_prob_fn,
     )
+    policy_holder["policy"] = policy
 
     env = SingleEnvWebsocketEnv(
         SingleEnvWsConfig(
@@ -121,8 +228,16 @@ def main() -> None:
             action_key=args.env_action_key,
         )
     )
-    provider = FixedRewardProvider(reward=float(args.fixed_reward))
-    collector = Pi0FastChunkCollector(env=env, policy=policy, provider=provider)
+    if args.reward_mode == "fixed":
+        provider = FixedRewardProvider(reward=float(args.fixed_reward))
+    else:
+        provider = EnvChunkRewardProvider()
+    collector = Pi0FastChunkCollector(
+        env=env,
+        policy=policy,
+        provider=provider,
+        value_predictor=value_client,
+    )
 
     rl_cfg = Pi0FastOnlineRLConfig(
         rollout_batch_size=args.rollout_batch_size,
@@ -136,13 +251,21 @@ def main() -> None:
         max_policy_lag=args.max_policy_lag,
         total_updates=args.total_updates,
         seed=args.seed,
+        explored_chunk_weight=args.explored_chunk_weight,
+        non_explored_chunk_weight=args.non_explored_chunk_weight,
     )
 
-    trainer = Pi0FastOnlineTrainer(cfg=rl_cfg, policy=policy, collector=collector)
+    trainer = Pi0FastOnlineTrainer(
+        cfg=rl_cfg,
+        policy=policy,
+        collector=collector,
+    )
     try:
         trainer.train()
     finally:
         env.close()
+        if value_client is not None:
+            value_client.close()
 
 
 if __name__ == "__main__":
