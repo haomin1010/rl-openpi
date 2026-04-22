@@ -98,7 +98,7 @@ class Pi0FastRLPolicy:
         valid = toks[mask]
         return valid if valid.size > 0 else toks[:0]
 
-    def sample_chunk(self, obs: dict[str, Any]) -> dict[str, Any]:
+    def sample_chunk(self, obs: dict[str, Any], *, include_logprobs: bool = True) -> dict[str, Any]:
         observation, transformed = self._prepare_observation(obs)
         self._rng, sample_rng = jax.random.split(self._rng)
         trace = self._model.sample_actions_with_trace(sample_rng, observation, **self._sample_kwargs)
@@ -106,7 +106,9 @@ class Pi0FastRLPolicy:
         sampled_action_tokens = np.asarray(trace["tokens"][0], dtype=np.int32)
         sampled_action_token_mask = np.asarray(trace["token_mask"][0], dtype=bool)
         sampled_valid_tokens = self._truncate_by_mask(sampled_action_tokens, sampled_action_token_mask)
-        if self._keyframe_prob_fn is not None:
+        if str(self._exploration_cfg.mode) == "never":
+            keyframe_prob = 0.0
+        elif self._keyframe_prob_fn is not None:
             keyframe_prob = float(self._keyframe_prob_fn(obs))
         else:
             keyframe_prob = self.predict_keyframe_prob(obs) if getattr(self._model, "keyframe_head", None) is not None else 0.0
@@ -137,12 +139,15 @@ class Pi0FastRLPolicy:
             executed_action_tokens_unpadded,
             sampled_action_tokens.shape[0],
         )
-        old_token_stats = self._model.recompute_action_logprobs(
-            observation,
-            jnp.asarray(executed_action_tokens, dtype=jnp.int32)[np.newaxis, ...],
-            action_token_mask=jnp.asarray(executed_action_token_mask, dtype=jnp.bool_)[np.newaxis, ...],
-        )
-        old_token_logprobs = np.asarray(old_token_stats["token_logprobs"][0], dtype=np.float32)
+        if include_logprobs:
+            old_token_stats = self._model.recompute_action_logprobs(
+                observation,
+                jnp.asarray(executed_action_tokens, dtype=jnp.int32)[np.newaxis, ...],
+                action_token_mask=jnp.asarray(executed_action_token_mask, dtype=jnp.bool_)[np.newaxis, ...],
+            )
+            old_token_logprobs = np.asarray(old_token_stats["token_logprobs"][0], dtype=np.float32)
+        else:
+            old_token_logprobs = np.zeros(executed_action_tokens.shape, dtype=np.float32)
         decoded_actions = self._fast_tokenizer.decode_action_dct_coeffs(explored_dct_coeffs)
         decoded_actions = np.asarray(decoded_actions, dtype=np.float32)
         outputs = self._post_extract_output_transform(

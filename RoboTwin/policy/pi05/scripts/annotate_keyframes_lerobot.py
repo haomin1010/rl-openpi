@@ -7,6 +7,8 @@ import pathlib
 
 import numpy as np
 
+from openpi_online_ppo.data.local_lerobot_loader import ensure_local_hf_cache
+
 
 def _to_hwc_uint8(img) -> np.ndarray:
     arr = img
@@ -74,6 +76,7 @@ def main() -> None:
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
+    ensure_local_hf_cache()
     ds = LeRobotDataset(repo_id=args.repo_id, root=args.dataset_root)
     ep_rows = _build_episode_frame_rows(ds)
     lengths = _episode_lengths(ds)

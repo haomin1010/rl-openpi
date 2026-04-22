@@ -12,6 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from openpi_online_ppo.data.local_lerobot_loader import ensure_local_hf_cache
+
 
 def _build_ortho_dct_matrix(n: int) -> np.ndarray:
     k = np.arange(n, dtype=np.float32)[:, None]
@@ -96,6 +98,7 @@ def main() -> None:
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
+    ensure_local_hf_cache()
     ann = json.loads(pathlib.Path(args.annotations_json).read_text(encoding="utf-8"))
     ann_eps: dict[int, list[int]] = {int(k): sorted(set(int(x) for x in v)) for k, v in ann.get("episodes", {}).items()}
 
@@ -287,4 +290,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

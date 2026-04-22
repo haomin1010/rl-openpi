@@ -65,7 +65,18 @@ class ValueWebsocketClient:
             }
         )
 
-    def train_mc_from_lerobot(self, *, dataset_root: str, repo_id: str) -> dict[str, float]:
+    @staticmethod
+    def _coerce_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in metrics.items():
+            key = str(k)
+            try:
+                out[key] = float(v)
+            except (TypeError, ValueError):
+                out[key] = v
+        return out
+
+    def train_mc_from_lerobot(self, *, dataset_root: str, repo_id: str) -> dict[str, Any]:
         resp = self._request(
             {
                 "cmd": "train_mc_from_lerobot",
@@ -76,7 +87,7 @@ class ValueWebsocketClient:
         metrics = resp.get("metrics", {})
         if not isinstance(metrics, dict):
             return {}
-        return {str(k): float(v) for k, v in metrics.items()}
+        return self._coerce_metrics(metrics)
 
     def train_keyframe_from_lerobot(
         self,
@@ -84,7 +95,7 @@ class ValueWebsocketClient:
         dataset_root: str,
         repo_id: str,
         annotations_json: str,
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         resp = self._request(
             {
                 "cmd": "train_keyframe_from_lerobot",
@@ -96,7 +107,7 @@ class ValueWebsocketClient:
         metrics = resp.get("metrics", {})
         if not isinstance(metrics, dict):
             return {}
-        return {str(k): float(v) for k, v in metrics.items()}
+        return self._coerce_metrics(metrics)
 
     def close(self) -> None:
         try:

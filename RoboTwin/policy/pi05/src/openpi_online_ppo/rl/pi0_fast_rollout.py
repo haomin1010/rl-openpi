@@ -35,14 +35,20 @@ class Pi0FastChunkCollector:
         policy: Pi0FastRLPolicy,
         provider: ChunkRewardValueProvider,
         value_predictor: ValuePredictor | None = None,
+        compute_values: bool = True,
+        include_logprobs: bool = True,
     ) -> None:
         self._env = env
         self._policy = policy
         self._provider = provider
         self._value_predictor = value_predictor
+        self._compute_values = bool(compute_values)
+        self._include_logprobs = bool(include_logprobs)
         self._state: _EnvState | None = None
 
     def _predict_value(self, obs: dict[str, Any], transformed_obs: dict[str, Any] | None = None) -> float:
+        if not self._compute_values:
+            return 0.0
         if self._value_predictor is None:
             return self._policy.predict_value(obs)
         transformed_obs = transformed_obs if transformed_obs is not None else self._policy.transform_observation(obs)
@@ -63,7 +69,7 @@ class Pi0FastChunkCollector:
             raise RuntimeError("Collector must be reset before collecting chunks.")
 
         state = self._state
-        trace = self._policy.sample_chunk(state.obs)
+        trace = self._policy.sample_chunk(state.obs, include_logprobs=self._include_logprobs)
         action_chunk = trace["action_chunk"]
         next_obs, env_reward, done, info = self._env.step(action_chunk)
         task = next_obs.get("prompt", state.task or "")

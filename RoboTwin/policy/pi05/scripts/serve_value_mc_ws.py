@@ -26,6 +26,7 @@ from openpi.models import pi0_fast as _base_pi0_fast
 import openpi.shared.nnx_utils as nnx_utils
 from openpi.training import config as train_config
 from openpi_client import msgpack_numpy
+from openpi_online_ppo.data.local_lerobot_loader import ensure_local_hf_cache
 from openpi_online_ppo.models import pi0_fast_rl as _rl_pi0_fast
 from openpi_online_ppo.rl.pi0_fast_policy import create_trained_pi0_fast_rl_policy
 
@@ -70,7 +71,9 @@ class ValueMCService:
         init_state_file: str | None,
     ) -> None:
         cfg = _to_rl_train_config(train_config.get_config(policy_config))
+        log.info("loading RL policy config=%s checkpoint=%s", policy_config, policy_path)
         policy = create_trained_pi0_fast_rl_policy(cfg, policy_path)
+        log.info("RL policy loaded; initializing value/keyframe service state")
         self._policy_wrapper = policy
         self._model_def = nnx.graphdef(policy.model)
         self._params = nnx.state(policy.model)
@@ -371,6 +374,7 @@ class ValueMCService:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
         log.info("train_mc_from_lerobot start dataset_root=%s repo_id=%s", dataset_root, repo_id)
+        ensure_local_hf_cache()
         ds = LeRobotDataset(repo_id=repo_id, root=dataset_root)
         if len(ds) == 0:
             log.info("train_mc_from_lerobot empty dataset.")
@@ -558,6 +562,7 @@ class ValueMCService:
         ann = json.loads(pathlib.Path(annotations_json).read_text(encoding="utf-8"))
         ann_eps = {int(k): sorted(set(int(x) for x in v)) for k, v in ann.get("episodes", {}).items()}
 
+        ensure_local_hf_cache()
         ds = LeRobotDataset(repo_id=repo_id, root=dataset_root)
         if len(ds) == 0:
             log.info("train_keyframe_from_lerobot empty dataset.")

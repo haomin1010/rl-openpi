@@ -224,6 +224,22 @@ class LeRobotEnvDatasetWriter:
         )
         self._outcome_log_path = self._root / "meta" / "online_episode_outcomes.jsonl"
 
+    @property
+    def root(self) -> pathlib.Path:
+        return self._root
+
+    @property
+    def repo_id(self) -> str:
+        return self._repo_id
+
+    @property
+    def saved_episode_count(self) -> int:
+        return self._saved_episode_count
+
+    @property
+    def has_open_frames(self) -> bool:
+        return bool(self._episode_open and self._episode_has_frames)
+
     def start_episode(self) -> None:
         self._episode_open = True
         self._episode_has_frames = False
@@ -283,6 +299,138 @@ class LeRobotEnvDatasetWriter:
         self._episode_frame_idx = 0
 
 
+class LeRobotRoundDatasetManager:
+    """Manage per-round LeRobot datasets under a shared base directory."""
+
+    def __init__(
+        self,
+        *,
+        base_root: pathlib.Path,
+        base_repo_id: str,
+        fps: int = 50,
+        overwrite: bool = False,
+        resize_to_640x480: bool = True,
+    ) -> None:
+        self._base_root = base_root.resolve()
+        self._base_repo_id = str(base_repo_id)
+        self._fps = int(fps)
+        self._resize_to_640x480 = bool(resize_to_640x480)
+        if overwrite and self._base_root.exists():
+            shutil.rmtree(self._base_root)
+        self._base_root.mkdir(parents=True, exist_ok=True)
+        self._round_manifest = self._base_root / "rounds.jsonl"
+        self._current_writer: LeRobotEnvDatasetWriter | None = None
+        self._next_round_index = self._discover_next_round_index()
+
+    @property
+    def base_root(self) -> pathlib.Path:
+        return self._base_root
+
+    def _discover_next_round_index(self) -> int:
+        max_idx = -1
+        for child in self._base_root.glob("round_*"):
+            if not child.is_dir():
+                continue
+            try:
+                max_idx = max(max_idx, int(child.name.split("_")[-1]))
+            except Exception:
+                continue
+        return max_idx + 1
+
+    def _round_root(self, round_index: int) -> pathlib.Path:
+        return self._base_root / f"round_{int(round_index):06d}"
+
+    def _round_repo_id(self, round_index: int) -> str:
+        return f"{self._base_repo_id}_round_{int(round_index):06d}"
+
+    def _ensure_writer(self) -> LeRobotEnvDatasetWriter:
+        if self._current_writer is None:
+            round_index = int(self._next_round_index)
+            self._current_writer = LeRobotEnvDatasetWriter(
+                root=self._round_root(round_index),
+                repo_id=self._round_repo_id(round_index),
+                fps=self._fps,
+                overwrite=True,
+                resize_to_640x480=self._resize_to_640x480,
+            )
+        return self._current_writer
+
+    def start_episode(self) -> None:
+        self._ensure_writer().start_episode()
+
+    def add_step(self, *, raw_obs: dict[str, Any], action: np.ndarray, task: str) -> None:
+        self._ensure_writer().add_step(raw_obs=raw_obs, action=action, task=task)
+
+    def end_episode(
+        self,
+        *,
+        commit: bool = True,
+        success: bool | None = None,
+        step_lim: int | None = None,
+        seed: int | None = None,
+        prompt: str | None = None,
+    ) -> None:
+        if self._current_writer is None:
+            return
+        self._current_writer.end_episode(
+            commit=commit,
+            success=success,
+            step_lim=step_lim,
+            seed=seed,
+            prompt=prompt,
+        )
+
+    def finalize_round(self) -> dict[str, Any]:
+        if self._current_writer is None:
+            return {
+                "ok": True,
+                "round_index": None,
+                "dataset_root": None,
+                "repo_id": None,
+                "num_episodes": 0,
+            }
+
+        writer = self._current_writer
+        if writer.has_open_frames:
+            writer.end_episode(commit=True, success=None, step_lim=None, seed=None, prompt=None)
+        else:
+            writer.end_episode(commit=False)
+        round_index = int(self._next_round_index)
+        num_episodes = int(writer.saved_episode_count)
+        dataset_root = writer.root
+        repo_id = writer.repo_id
+
+        if num_episodes <= 0:
+            if dataset_root.exists():
+                shutil.rmtree(dataset_root)
+            result = {
+                "ok": True,
+                "round_index": round_index,
+                "dataset_root": None,
+                "repo_id": repo_id,
+                "num_episodes": 0,
+            }
+        else:
+            rec = {
+                "round_index": round_index,
+                "dataset_root": str(dataset_root),
+                "repo_id": str(repo_id),
+                "num_episodes": num_episodes,
+            }
+            self._round_manifest.parent.mkdir(parents=True, exist_ok=True)
+            with self._round_manifest.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            result = {"ok": True, **rec}
+
+        self._current_writer = None
+        self._next_round_index += 1
+        return result
+
+    def close(self) -> None:
+        if self._current_writer is not None:
+            self._current_writer.end_episode(commit=False)
+
+
 class RoboTwinEnvSession:
     def __init__(
         self,
@@ -316,7 +464,7 @@ class RoboTwinEnvSession:
         self._save_video = bool(save_video)
         self._video_save_dir = str(video_save_dir) if video_save_dir else None
         self._ffmpeg_started = False
-        self._lerobot_writer: LeRobotEnvDatasetWriter | None = None
+        self._lerobot_manager: LeRobotRoundDatasetManager | None = None
         self._latest_raw_obs: dict[str, Any] | None = None
 
         self._task_env = _instantiate_task(repo_root, task_name)
@@ -328,9 +476,9 @@ class RoboTwinEnvSession:
             self._task_args["eval_video_log"] = True
         if save_lerobot:
             lerobot_base = pathlib.Path(lerobot_root) if lerobot_root else (repo_root / "eval_result" / "online_ws_lerobot")
-            self._lerobot_writer = LeRobotEnvDatasetWriter(
-                root=lerobot_base,
-                repo_id=str(lerobot_repo_id),
+            self._lerobot_manager = LeRobotRoundDatasetManager(
+                base_root=lerobot_base,
+                base_repo_id=str(lerobot_repo_id),
                 fps=int(lerobot_fps),
                 overwrite=bool(lerobot_overwrite),
                 resize_to_640x480=bool(lerobot_resize_to_640x480),
@@ -343,8 +491,8 @@ class RoboTwinEnvSession:
 
     def close(self) -> None:
         self._stop_episode_recording()
-        if self._lerobot_writer is not None:
-            self._lerobot_writer.end_episode(commit=False)
+        if self._lerobot_manager is not None:
+            self._lerobot_manager.close()
         try:
             self._task_env.close_env(clear_cache=False)
         except Exception:
@@ -367,8 +515,8 @@ class RoboTwinEnvSession:
 
     def _safe_close_env(self) -> None:
         self._stop_episode_recording()
-        if self._lerobot_writer is not None:
-            self._lerobot_writer.end_episode(commit=False)
+        if self._lerobot_manager is not None:
+            self._lerobot_manager.close()
         try:
             self._task_env.close_env(clear_cache=False)
         except Exception:
@@ -517,8 +665,8 @@ class RoboTwinEnvSession:
 
         self._state = EpisodeState(seed=seed, task_name=self._task_name, prompt=prompt)
         self._episode_id += 1
-        if self._lerobot_writer is not None:
-            self._lerobot_writer.start_episode()
+        if self._lerobot_manager is not None:
+            self._lerobot_manager.start_episode()
 
         raw_obs = self._task_env.get_obs()
         self._latest_raw_obs = raw_obs
@@ -558,8 +706,8 @@ class RoboTwinEnvSession:
             pre_obs = current_raw_obs
             self._task_env.take_action(action)
             current_raw_obs = self._task_env.get_obs()
-            if self._lerobot_writer is not None and self._state is not None:
-                self._lerobot_writer.add_step(
+            if self._lerobot_manager is not None and self._state is not None:
+                self._lerobot_manager.add_step(
                     raw_obs=pre_obs,
                     action=np.asarray(action, dtype=np.float32),
                     task=self._state.prompt,
@@ -582,8 +730,8 @@ class RoboTwinEnvSession:
                 flush=True,
             )
             self._stop_episode_recording()
-            if self._lerobot_writer is not None:
-                self._lerobot_writer.end_episode(
+            if self._lerobot_manager is not None:
+                self._lerobot_manager.end_episode(
                     commit=True,
                     success=bool(self._task_env.eval_success),
                     step_lim=int(self._task_env.step_lim),
@@ -611,6 +759,14 @@ class RoboTwinEnvSession:
                 "plan_success": bool(getattr(self._task_env, "plan_success", True)),
             },
         }
+
+    def finalize_collection_round(self) -> dict[str, Any]:
+        self._stop_episode_recording()
+        if self._lerobot_manager is None:
+            return {"ok": True, "dataset_root": None, "repo_id": None, "num_episodes": 0, "round_index": None}
+        result = self._lerobot_manager.finalize_round()
+        print(f"[env_ws_round_finalized] {json.dumps(result, ensure_ascii=False)}", flush=True)
+        return result
 
 
 class RoboTwinWebsocketEnvServer:
@@ -642,6 +798,8 @@ class RoboTwinWebsocketEnvServer:
                     resp = self._session.reset(msg)
                 elif cmd == "step":
                     resp = self._session.step(msg)
+                elif cmd == "finalize_collection_round":
+                    resp = self._session.finalize_collection_round()
                 else:
                     raise ValueError(f"Unknown cmd: {cmd}")
 
