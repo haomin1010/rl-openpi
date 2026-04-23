@@ -99,7 +99,7 @@ def _parse_args() -> argparse.Namespace:
         "--explore_perturb_backend",
         type=str,
         default="dct_gaussian",
-        choices=("dct_gaussian", "action_formula", "action_network", "action_hybrid"),
+        choices=("dct_gaussian", "dct_network", "action_formula", "action_network", "action_hybrid"),
     )
     p.add_argument("--explore_action_radius_min", type=float, default=0.0)
     p.add_argument("--explore_action_radius_max", type=float, default=0.15)

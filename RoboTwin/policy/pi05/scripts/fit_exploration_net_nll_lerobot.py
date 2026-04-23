@@ -35,6 +35,37 @@ def _extract_vec(item: dict[str, Any], key: str) -> np.ndarray:
     return _to_np(item[key]).astype(np.float32).reshape(-1)
 
 
+def _parse_dim_list(raw: str | None) -> tuple[int, ...] | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s == "" or s.lower() in {"all", "none"}:
+        return None
+    out: list[int] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if tok:
+            out.append(int(tok))
+    return tuple(out) if out else None
+
+
+def _default_action_noise_dims(action_dim: int) -> tuple[int, ...] | None:
+    if int(action_dim) == 14:
+        return (0, 1, 2, 7, 8, 9)
+    return None
+
+
+def _build_action_dim_mask(action_dim: int, allowed: tuple[int, ...] | None) -> np.ndarray:
+    if allowed is None:
+        return np.ones((int(action_dim),), dtype=np.float32)
+    mask = np.zeros((int(action_dim),), dtype=np.float32)
+    for idx in allowed:
+        i = int(idx)
+        if 0 <= i < int(action_dim):
+            mask[i] = 1.0
+    return mask
+
+
 def _init_mlp_params(
     *,
     rng: jax.Array,
@@ -88,6 +119,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--radius_max", type=float, default=0.2)
     p.add_argument("--nll_sigma", type=float, default=0.05)
     p.add_argument("--smooth_coef", type=float, default=0.0)
+    p.add_argument(
+        "--action_noise_dims",
+        type=str,
+        default="auto",
+        help="Comma-separated action dims to perturb when constructing DCT targets. "
+        "'auto' defaults to 0,1,2,7,8,9 for 14D EE actions; empty/all means all dims.",
+    )
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -117,6 +155,12 @@ def main() -> None:
         ep_frames[ep].sort(key=lambda x: x[0])
 
     action_dim = int(ep_frames[next(iter(ep_frames))][0][1].shape[0])
+    raw_noise_dims = str(args.action_noise_dims).strip().lower()
+    if raw_noise_dims == "auto":
+        action_noise_dims = _default_action_noise_dims(action_dim)
+    else:
+        action_noise_dims = _parse_dim_list(args.action_noise_dims)
+    action_dim_mask = _build_action_dim_mask(action_dim, action_noise_dims)
     chunk_size = int(args.chunk_size)
     dct_k = int(args.dct_k)
     if not (1 <= dct_k <= chunk_size):
@@ -191,7 +235,7 @@ def main() -> None:
             noise[:, t, :] = ar_rho * noise[:, t - 1, :] + alpha * eps[:, t, :]
         if ar_clip > 0:
             noise = np.clip(noise, -ar_clip, ar_clip).astype(np.float32)
-        return noise
+        return (noise * action_dim_mask.reshape(1, 1, -1)).astype(np.float32)
 
     @jax.jit
     def train_step(
@@ -255,6 +299,14 @@ def main() -> None:
             losses.append(float(np.asarray(loss)))
         print(f"[epoch {epoch + 1}/{args.epochs}] loss={float(np.mean(losses)):.6f}")
 
+    print(
+        "[explore_nll_target_construction]",
+        {
+            "action_dim": int(action_dim),
+            "action_noise_dims": None if action_noise_dims is None else [int(x) for x in action_noise_dims],
+        },
+    )
+
     out = pathlib.Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     layers_payload: list[dict[str, np.ndarray]] = []
@@ -278,6 +330,8 @@ def main() -> None:
             "radius_min": float(radius_min),
             "radius_max": float(radius_max),
             "latent_dim": int(latent_dim),
+            "action_noise_dims": None if action_noise_dims is None else [int(x) for x in action_noise_dims],
+            "target_construction": "masked_action_to_dct",
         },
         "x_mean": x_mean.astype(np.float32),
         "x_std": x_std.astype(np.float32),

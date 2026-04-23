@@ -1,12 +1,21 @@
 import sys
 
 import os
+import pathlib
 import h5py
 import numpy as np
 import pickle
 import cv2
 import argparse
 import yaml, json
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC_ROOT = ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from openpi_online_ppo.ee_delta import ee_action14_from_pose_pair
+from openpi_online_ppo.ee_delta import ee_obs14_from_episode_ref
 
 
 def load_hdf5(dataset_path):
@@ -23,11 +32,25 @@ def load_hdf5(dataset_path):
             root["/joint_action/right_gripper"][()],
             root["/joint_action/right_arm"][()],
         )
+        left_endpose = root["/endpose/left_endpose"][()]
+        left_ee_gripper = root["/endpose/left_gripper"][()]
+        right_endpose = root["/endpose/right_endpose"][()]
+        right_ee_gripper = root["/endpose/right_gripper"][()]
         image_dict = dict()
         for cam_name in root[f"/observation/"].keys():
             image_dict[cam_name] = root[f"/observation/{cam_name}/rgb"][()]
 
-    return left_gripper, left_arm, right_gripper, right_arm, image_dict
+    return (
+        left_gripper,
+        left_arm,
+        right_gripper,
+        right_arm,
+        left_endpose,
+        left_ee_gripper,
+        right_endpose,
+        right_ee_gripper,
+        image_dict,
+    )
 
 
 def images_encoding(imgs):
@@ -51,7 +74,7 @@ def get_task_config(task_name):
     return args
 
 
-def data_transform(path, episode_num, save_path):
+def data_transform(path, episode_num, save_path, representation):
     begin = 0
     floders = os.listdir(path)
     # assert episode_num <= len(floders), "data num not enough"
@@ -76,8 +99,17 @@ def data_transform(path, episode_num, save_path):
         ) as f:
             json.dump(save_instructions_json, f, indent=2)
 
-        left_gripper_all, left_arm_all, right_gripper_all, right_arm_all, image_dict = (load_hdf5(
-            os.path.join(path, "data", f"episode{i}.hdf5")))
+        (
+            left_gripper_all,
+            left_arm_all,
+            right_gripper_all,
+            right_arm_all,
+            left_endpose_all,
+            left_ee_gripper_all,
+            right_endpose_all,
+            right_ee_gripper_all,
+            image_dict,
+        ) = load_hdf5(os.path.join(path, "data", f"episode{i}.hdf5"))
         qpos = []
         actions = []
         cam_high = []
@@ -96,9 +128,25 @@ def data_transform(path, episode_num, save_path):
                 right_arm_all[j],
             )
 
-            state = np.array(left_arm.tolist() + [left_gripper] + right_arm.tolist() + [right_gripper])  # joints angle
+            joint_state = np.array(left_arm.tolist() + [left_gripper] + right_arm.tolist() + [right_gripper], dtype=np.float32)
 
-            state = state.astype(np.float32)
+            if representation == "ee_delta":
+                left_pose = np.asarray(left_endpose_all[j], dtype=np.float32)
+                right_pose = np.asarray(right_endpose_all[j], dtype=np.float32)
+                left_grip_obs = float(left_ee_gripper_all[j])
+                right_grip_obs = float(right_ee_gripper_all[j])
+                left_ref_quat = np.asarray(left_endpose_all[0], dtype=np.float32)[3:]
+                right_ref_quat = np.asarray(right_endpose_all[0], dtype=np.float32)[3:]
+                state = ee_obs14_from_episode_ref(
+                    left_pose7=left_pose,
+                    left_grip=left_grip_obs,
+                    right_pose7=right_pose,
+                    right_grip=right_grip_obs,
+                    left_ref_quat_wxyz=left_ref_quat,
+                    right_ref_quat_wxyz=right_ref_quat,
+                )
+            else:
+                state = joint_state.astype(np.float32)
 
             if j != left_gripper_all.shape[0] - 1:
                 qpos.append(state)
@@ -119,7 +167,17 @@ def data_transform(path, episode_num, save_path):
                 cam_left_wrist.append(camera_left_wrist_resized)
 
             if j != 0:
-                action = state
+                if representation == "ee_delta":
+                    action = ee_action14_from_pose_pair(
+                        left_pose7_t=np.asarray(left_endpose_all[j - 1], dtype=np.float32),
+                        left_grip_t1=float(left_ee_gripper_all[j]),
+                        left_pose7_t1=np.asarray(left_endpose_all[j], dtype=np.float32),
+                        right_pose7_t=np.asarray(right_endpose_all[j - 1], dtype=np.float32),
+                        right_grip_t1=float(right_ee_gripper_all[j]),
+                        right_pose7_t1=np.asarray(right_endpose_all[j], dtype=np.float32),
+                    )
+                else:
+                    action = state
                 actions.append(action)
                 left_arm_dim.append(left_arm.shape[0])
                 right_arm_dim.append(right_arm.shape[0])
@@ -161,20 +219,29 @@ if __name__ == "__main__":
         default=50,
         help="Number of episodes to process (e.g., 50)",
     )
+    parser.add_argument(
+        "--representation",
+        type=str,
+        default="joint",
+        choices=("joint", "ee_delta"),
+        help="Output representation for observations/actions.",
+    )
     args = parser.parse_args()
 
     task_name = args.task_name
     setting = args.setting
     expert_data_num = args.expert_data_num
+    representation = str(args.representation)
 
     load_dir = os.path.join("../../data", str(task_name), str(setting))
 
     begin = 0
     print(f'read data from path:{os.path.join("data", load_dir)}')
 
-    target_dir = f"processed_data/{task_name}-{setting}-{expert_data_num}"
+    target_dir = f"processed_data/{task_name}-{setting}-{expert_data_num}-{representation}"
     begin = data_transform(
         load_dir,
         expert_data_num,
         target_dir,
+        representation,
     )

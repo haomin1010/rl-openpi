@@ -21,6 +21,9 @@ import websockets.frames
 import yaml
 
 from openpi_client import msgpack_numpy
+from openpi_online_ppo.ee_delta import ee_exec_action16_from_delta_action14
+from openpi_online_ppo.ee_delta import ee_obs14_from_episode_ref
+from openpi_online_ppo.ee_delta import extract_raw_ee_from_env_obs
 
 
 def _resolve_repo_root(repo_root: str | None) -> pathlib.Path:
@@ -125,6 +128,74 @@ def _to_chw_uint8(image: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported image shape for CHW conversion: {arr.shape}")
 
 
+def _dataset_feature_spec(control_mode: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    mode = str(control_mode)
+    if mode == "ee_delta":
+        state_spec = {
+            "dtype": "float32",
+            "shape": (14,),
+            "names": [[
+                "left_x",
+                "left_y",
+                "left_z",
+                "left_rotvec_x",
+                "left_rotvec_y",
+                "left_rotvec_z",
+                "left_gripper",
+                "right_x",
+                "right_y",
+                "right_z",
+                "right_rotvec_x",
+                "right_rotvec_y",
+                "right_rotvec_z",
+                "right_gripper",
+            ]],
+        }
+        action_spec = {
+            "dtype": "float32",
+            "shape": (14,),
+            "names": [[
+                "left_dx",
+                "left_dy",
+                "left_dz",
+                "left_drotvec_x",
+                "left_drotvec_y",
+                "left_drotvec_z",
+                "left_gripper_target",
+                "right_dx",
+                "right_dy",
+                "right_dz",
+                "right_drotvec_x",
+                "right_drotvec_y",
+                "right_drotvec_z",
+                "right_gripper_target",
+            ]],
+        }
+        return state_spec, action_spec
+
+    state_spec = {
+        "dtype": "float32",
+        "shape": (14,),
+        "names": [[
+            "left_waist",
+            "left_shoulder",
+            "left_elbow",
+            "left_forearm_roll",
+            "left_wrist_angle",
+            "left_wrist_rotate",
+            "left_gripper",
+            "right_waist",
+            "right_shoulder",
+            "right_elbow",
+            "right_forearm_roll",
+            "right_wrist_angle",
+            "right_wrist_rotate",
+            "right_gripper",
+        ]],
+    }
+    return state_spec, dict(state_spec)
+
+
 @dataclass
 class EpisodeState:
     seed: int
@@ -144,6 +215,7 @@ class LeRobotEnvDatasetWriter:
         robot_type: str = "aloha",
         overwrite: bool = False,
         resize_to_640x480: bool = True,
+        control_mode: str = "qpos",
     ) -> None:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
@@ -151,53 +223,17 @@ class LeRobotEnvDatasetWriter:
         self._repo_id = str(repo_id)
         self._fps = int(fps)
         self._resize_to_640x480 = bool(resize_to_640x480)
+        self._control_mode = str(control_mode)
         self._episode_open = False
         self._episode_has_frames = False
         self._episode_frame_idx = 0
         self._saved_episode_count = 0
         if overwrite and self._root.exists():
             shutil.rmtree(self._root)
+        state_spec, action_spec = _dataset_feature_spec(self._control_mode)
         features = {
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (14,),
-                "names": [[
-                    "left_waist",
-                    "left_shoulder",
-                    "left_elbow",
-                    "left_forearm_roll",
-                    "left_wrist_angle",
-                    "left_wrist_rotate",
-                    "left_gripper",
-                    "right_waist",
-                    "right_shoulder",
-                    "right_elbow",
-                    "right_forearm_roll",
-                    "right_wrist_angle",
-                    "right_wrist_rotate",
-                    "right_gripper",
-                ]],
-            },
-            "action": {
-                "dtype": "float32",
-                "shape": (14,),
-                "names": [[
-                    "left_waist",
-                    "left_shoulder",
-                    "left_elbow",
-                    "left_forearm_roll",
-                    "left_wrist_angle",
-                    "left_wrist_rotate",
-                    "left_gripper",
-                    "right_waist",
-                    "right_shoulder",
-                    "right_elbow",
-                    "right_forearm_roll",
-                    "right_wrist_angle",
-                    "right_wrist_rotate",
-                    "right_gripper",
-                ]],
-            },
+            "observation.state": state_spec,
+            "action": action_spec,
             "observation.images.cam_high": {
                 "dtype": "image",
                 "shape": (3, 480, 640),
@@ -245,7 +281,7 @@ class LeRobotEnvDatasetWriter:
         self._episode_has_frames = False
         self._episode_frame_idx = 0
 
-    def add_step(self, *, raw_obs: dict[str, Any], action: np.ndarray, task: str) -> None:
+    def add_step(self, *, raw_obs: dict[str, Any], action: np.ndarray, task: str, state_vec: np.ndarray | None = None) -> None:
         if not self._episode_open:
             self.start_episode()
         cam_obs = raw_obs["observation"]
@@ -256,8 +292,10 @@ class LeRobotEnvDatasetWriter:
             head_rgb = cv2.resize(head_rgb, (640, 480))
             left_rgb = cv2.resize(left_rgb, (640, 480))
             right_rgb = cv2.resize(right_rgb, (640, 480))
+        if state_vec is None:
+            state_vec = np.asarray(raw_obs["joint_action"]["vector"], dtype=np.float32)
         frame = {
-            "observation.state": np.asarray(raw_obs["joint_action"]["vector"], dtype=np.float32),
+            "observation.state": np.asarray(state_vec, dtype=np.float32).reshape(-1),
             "action": np.asarray(action, dtype=np.float32).reshape(-1),
             "observation.images.cam_high": _to_chw_uint8(head_rgb),
             "observation.images.cam_left_wrist": _to_chw_uint8(left_rgb),
@@ -310,11 +348,13 @@ class LeRobotRoundDatasetManager:
         fps: int = 50,
         overwrite: bool = False,
         resize_to_640x480: bool = True,
+        control_mode: str = "qpos",
     ) -> None:
         self._base_root = base_root.resolve()
         self._base_repo_id = str(base_repo_id)
         self._fps = int(fps)
         self._resize_to_640x480 = bool(resize_to_640x480)
+        self._control_mode = str(control_mode)
         if overwrite and self._base_root.exists():
             shutil.rmtree(self._base_root)
         self._base_root.mkdir(parents=True, exist_ok=True)
@@ -352,14 +392,15 @@ class LeRobotRoundDatasetManager:
                 fps=self._fps,
                 overwrite=True,
                 resize_to_640x480=self._resize_to_640x480,
+                control_mode=self._control_mode,
             )
         return self._current_writer
 
     def start_episode(self) -> None:
         self._ensure_writer().start_episode()
 
-    def add_step(self, *, raw_obs: dict[str, Any], action: np.ndarray, task: str) -> None:
-        self._ensure_writer().add_step(raw_obs=raw_obs, action=action, task=task)
+    def add_step(self, *, raw_obs: dict[str, Any], action: np.ndarray, task: str, state_vec: np.ndarray | None = None) -> None:
+        self._ensure_writer().add_step(raw_obs=raw_obs, action=action, task=task, state_vec=state_vec)
 
     def end_episode(
         self,
@@ -451,6 +492,7 @@ class RoboTwinEnvSession:
         lerobot_fps: int,
         lerobot_overwrite: bool,
         lerobot_resize_to_640x480: bool,
+        control_mode: str,
     ) -> None:
         self._repo_root = repo_root
         self._task_name = task_name
@@ -466,9 +508,16 @@ class RoboTwinEnvSession:
         self._ffmpeg_started = False
         self._lerobot_manager: LeRobotRoundDatasetManager | None = None
         self._latest_raw_obs: dict[str, Any] | None = None
+        self._control_mode = str(control_mode)
+        self._left_ref_quat: np.ndarray | None = None
+        self._right_ref_quat: np.ndarray | None = None
 
         self._task_env = _instantiate_task(repo_root, task_name)
         self._task_args = _build_task_args(repo_root, task_name, task_config)
+        if self._control_mode == "ee_delta":
+            data_type = dict(self._task_args.get("data_type", {}))
+            data_type["endpose"] = True
+            self._task_args["data_type"] = data_type
         if self._save_video:
             base_dir = pathlib.Path(self._video_save_dir) if self._video_save_dir else (repo_root / "eval_result" / "online_ws_video")
             base_dir.mkdir(parents=True, exist_ok=True)
@@ -482,6 +531,7 @@ class RoboTwinEnvSession:
                 fps=int(lerobot_fps),
                 overwrite=bool(lerobot_overwrite),
                 resize_to_640x480=bool(lerobot_resize_to_640x480),
+                control_mode=self._control_mode,
             )
         self._state: EpisodeState | None = None
 
@@ -498,6 +548,23 @@ class RoboTwinEnvSession:
         except Exception:
             pass
 
+    def _current_ref_quats(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._left_ref_quat is None or self._right_ref_quat is None:
+            raise RuntimeError("EE reference orientation is not initialized for this episode.")
+        return self._left_ref_quat, self._right_ref_quat
+
+    def _ee_state_from_raw_obs(self, raw_obs: dict[str, Any]) -> np.ndarray:
+        raw_ee = extract_raw_ee_from_env_obs(raw_obs)
+        left_ref_quat, right_ref_quat = self._current_ref_quats()
+        return ee_obs14_from_episode_ref(
+            left_pose7=raw_ee["left_pose7"],
+            left_grip=float(raw_ee["left_grip"]),
+            right_pose7=raw_ee["right_pose7"],
+            right_grip=float(raw_ee["right_grip"]),
+            left_ref_quat_wxyz=left_ref_quat,
+            right_ref_quat_wxyz=right_ref_quat,
+        )
+
     def _convert_observation(self, raw_obs: dict[str, Any]) -> dict[str, Any]:
         cam_obs = raw_obs["observation"]
         images = {
@@ -505,7 +572,10 @@ class RoboTwinEnvSession:
             "cam_left_wrist": _to_chw_uint8(cam_obs["left_camera"]["rgb"]),
             "cam_right_wrist": _to_chw_uint8(cam_obs["right_camera"]["rgb"]),
         }
-        state = np.asarray(raw_obs["joint_action"]["vector"], dtype=np.float32)
+        if self._control_mode == "ee_delta":
+            state = self._ee_state_from_raw_obs(raw_obs)
+        else:
+            state = np.asarray(raw_obs["joint_action"]["vector"], dtype=np.float32)
         prompt = self._state.prompt if self._state is not None else (self._default_prompt or self._task_name)
         return {
             "images": images,
@@ -670,6 +740,10 @@ class RoboTwinEnvSession:
 
         raw_obs = self._task_env.get_obs()
         self._latest_raw_obs = raw_obs
+        if self._control_mode == "ee_delta":
+            raw_ee = extract_raw_ee_from_env_obs(raw_obs)
+            self._left_ref_quat = np.asarray(raw_ee["left_pose7"][3:], dtype=np.float32)
+            self._right_ref_quat = np.asarray(raw_ee["right_pose7"][3:], dtype=np.float32)
         self._write_video_frame_from_obs(raw_obs)
         obs = self._convert_observation(raw_obs)
         return {
@@ -697,6 +771,10 @@ class RoboTwinEnvSession:
             action_chunk = action_chunk[None, :]
         if action_chunk.ndim != 2:
             raise ValueError(f"`action_chunk` must be rank-2, got shape={action_chunk.shape}")
+        if self._control_mode == "ee_delta" and action_chunk.shape[1] != 14:
+            raise ValueError(
+                f"`action_chunk` must have width 14 in ee_delta mode, got shape={action_chunk.shape}"
+            )
 
         consumed = 0
         current_raw_obs = self._latest_raw_obs if self._latest_raw_obs is not None else self._task_env.get_obs()
@@ -704,13 +782,27 @@ class RoboTwinEnvSession:
             if self._task_env.eval_success or self._task_env.take_action_cnt >= self._task_env.step_lim:
                 break
             pre_obs = current_raw_obs
-            self._task_env.take_action(action)
+            executed_action = np.asarray(action, dtype=np.float32)
+            if self._control_mode == "ee_delta":
+                raw_ee = extract_raw_ee_from_env_obs(pre_obs)
+                executed_action = ee_exec_action16_from_delta_action14(
+                    left_pose7_now=raw_ee["left_pose7"],
+                    left_grip_now=float(raw_ee["left_grip"]),
+                    right_pose7_now=raw_ee["right_pose7"],
+                    right_grip_now=float(raw_ee["right_grip"]),
+                    delta_action14=executed_action,
+                )
+                self._task_env.take_action(executed_action, action_type="ee")
+            else:
+                self._task_env.take_action(executed_action)
             current_raw_obs = self._task_env.get_obs()
             if self._lerobot_manager is not None and self._state is not None:
+                state_vec = self._convert_observation(pre_obs)["state"]
                 self._lerobot_manager.add_step(
                     raw_obs=pre_obs,
                     action=np.asarray(action, dtype=np.float32),
                     task=self._state.prompt,
+                    state_vec=np.asarray(state_vec, dtype=np.float32),
                 )
             self._write_video_frame_from_obs(current_raw_obs)
             consumed += 1
@@ -845,6 +937,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lerobot_repo_id", type=str, default="lerobot-hammer-online")
     parser.add_argument("--lerobot_fps", type=int, default=50)
     parser.add_argument("--lerobot_overwrite", action="store_true")
+    parser.add_argument("--control_mode", type=str, default="qpos", choices=("qpos", "ee_delta"))
     parser.add_argument(
         "--lerobot_resize_to_640x480",
         action=argparse.BooleanOptionalAction,
@@ -884,6 +977,7 @@ def main() -> None:
         lerobot_overwrite=args.lerobot_overwrite,
         lerobot_resize_to_640x480=args.lerobot_resize_to_640x480,
         seed_start=args.seed_start,
+        control_mode=args.control_mode,
     )
 
     server = RoboTwinWebsocketEnvServer(

@@ -213,7 +213,7 @@ class DirectionRadiusActionPerturbNet:
     def _dct_to_action(self, dct_coeffs: np.ndarray) -> np.ndarray:
         return self._dct_mat.T @ np.asarray(dct_coeffs, dtype=np.float32)
 
-    def sample_delta(self, *, actions: np.ndarray, keyframe_prob: float, obs: dict[str, Any]) -> np.ndarray:
+    def sample_delta_dct(self, *, actions: np.ndarray, keyframe_prob: float, obs: dict[str, Any]) -> np.ndarray:
         del obs
         act = np.asarray(actions, dtype=np.float32)
         if act.ndim != 2:
@@ -232,11 +232,14 @@ class DirectionRadiusActionPerturbNet:
         radius_logit = float(out[self.out_dim])
         direction = _normalize_l2(dir_raw)
         base_radius = self.radius_min + (self.radius_max - self.radius_min) * (1.0 / (1.0 + np.exp(-radius_logit)))
-        # Keep compatibility with keyframe-gated exploration strength.
         radius = float(base_radius * np.clip(keyframe_prob, 0.0, 1.0))
         delta_flat = (direction * radius).astype(np.float32)
         delta_dct = np.zeros((self.chunk_size, self.action_dim), dtype=np.float32)
         delta_dct[: self.dct_k, :] = delta_flat.reshape(self.dct_k, self.action_dim)
+        return np.asarray(delta_dct, dtype=np.float32)
+
+    def sample_delta(self, *, actions: np.ndarray, keyframe_prob: float, obs: dict[str, Any]) -> np.ndarray:
+        delta_dct = self.sample_delta_dct(actions=actions, keyframe_prob=keyframe_prob, obs=obs)
         delta_act = self._dct_to_action(delta_dct)
         return np.asarray(delta_act, dtype=np.float32)
 
@@ -393,6 +396,11 @@ def default_dct_noise(
     formula_delta = _apply_action_dim_mask(_action_formula_delta(actions, keyframe_prob=keyframe_prob, cfg=cfg), cfg)
     net: DirectionRadiusActionPerturbNet | None = metadata.get("perturb_net")
 
+    if backend == "dct_network":
+        if net is None:
+            return coeffs
+        delta_dct = net.sample_delta_dct(actions=actions, keyframe_prob=keyframe_prob, obs=obs)
+        return np.asarray(coeffs + delta_dct, dtype=np.float32)
     if backend == "action_formula":
         delta = formula_delta
     elif backend == "action_network":

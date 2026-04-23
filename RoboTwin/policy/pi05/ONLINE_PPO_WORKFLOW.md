@@ -151,9 +151,29 @@ uv run python scripts/trigger_value_mc_train_ws.py \
   --repo_id lerobot_ppo_corpus
 ```
 
-## 3. Train Exploration Perturbation Net
+## 3. Train Exploration DCT Perturbation Net
 
-Train JAX direction+radius perturbation net (no sigma head, NLL objective):
+Train JAX DCT perturbation net (no sigma head, NLL objective).
+
+Important: the recommended chain is now:
+
+1. build clean action chunks from dataset
+2. add perturbation only on selected action dims
+3. re-encode perturbed action chunk back to DCT
+4. fit the exploration net to the resulting DCT perturbation target
+
+For the EE 14D action definition, the recommended default perturb dims are:
+
+- left arm translation: `0,1,2`
+- right arm translation: `7,8,9`
+
+So the practical default for EE mode is:
+
+```text
+--action_noise_dims "0,1,2,7,8,9"
+```
+
+Train command:
 
 ```bash
 uv run python scripts/fit_exploration_net_nll_lerobot.py \
@@ -164,6 +184,7 @@ uv run python scripts/fit_exploration_net_nll_lerobot.py \
   --chunk_size 32 \
   --dct_k 4 \
   --latent_dim 16 \
+  --action_noise_dims "0,1,2,7,8,9" \
   --epochs 30 \
   --batch_size 64
 ```
@@ -181,6 +202,7 @@ uv run python scripts/fit_exploration_net_nll_lerobot.py \
   --latent_dim 4 \
   --hidden_dim 32 \
   --hidden_depth 1 \
+  --action_noise_dims "0,1,2,7,8,9" \
   --epochs 1 \
   --batch_size 2 \
   --max_chunks 4
@@ -193,7 +215,13 @@ The generated checkpoint is a JAX-network parameter checkpoint:
 
 Run env server (same as step 1, usually keep it running).
 
-Run online PPO with value ws and exploration net (explicit named args, easy to edit):
+Run online PPO with value ws and exploration net (explicit named args, easy to edit).
+
+Recommended path:
+
+- exploration net is trained from masked action perturbation targets
+- online inference still works in DCT space
+- use `dct_network` instead of the older action-space backend chain
 
 ```bash
 uv run python scripts/train_pi0_fast_online_v2.py \
@@ -210,7 +238,7 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --explore_keyframe_threshold 0.5 \
   --explored_chunk_weight 1.0 \
   --non_explored_chunk_weight 1.0 \
-  --explore_perturb_backend action_network \
+  --explore_perturb_backend dct_network \
   --explore_action_radius_min 0.0 \
   --explore_action_radius_max 0.15 \
   --explore_action_abs_clip 1.0 \
@@ -218,11 +246,8 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --explore_network_ckpt checkpoints/explored_net/explore_dir_radius_nll.pkl \
   --explore_network_obs_dim 32 \
   --explore_network_latent_dim 16 \
-  --explore_keyframe_gate model_head \
-  --explore_action_noise_dims "0,1,2,3,4,5,7,8,9,10,11,12"
+  --explore_keyframe_gate model_head
 ```
-
-`--explore_action_noise_dims` lets you exclude gripper dimensions from exploration.
 
 ## Notes
 
@@ -230,3 +255,4 @@ uv run python scripts/train_pi0_fast_online_v2.py \
 2. Value and keyframe training logs are printed on the `serve_value_mc_ws.py` terminal.
 3. `serve_value_mc_ws.py` must be restarted after code changes.
 4. Current `train_aux_triplet_from_lerobot.sh` is optional convenience tooling. For the latest exploration net (`fit_exploration_net_nll_lerobot.py`), use manual commands above.
+5. In the current recommended design, `--explore_action_noise_dims` is mainly a training-target construction concept for the DCT exploration net, not the primary online backend control path.

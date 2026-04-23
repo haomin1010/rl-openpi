@@ -761,6 +761,64 @@ _CONFIGS = [
         num_train_steps=30000,
         fsdp_devices=1,  # refer line 359
     ),
+    TrainConfig(
+        name="pi0_fast_aloha_robotwin_full_ee_delta",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=32),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot-hammer-100",
+            adapt_to_pi=False,
+            use_delta_joint_actions=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        freeze_filter=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=32).get_freeze_filter(),
+        batch_size=128,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30000,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi0_fast_aloha_robotwin_ppo_ee_delta",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=32),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot-hammer-100",
+            adapt_to_pi=False,
+            use_delta_joint_actions=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        freeze_filter=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=32).get_freeze_filter(),
+        batch_size=128,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30000,
+        fsdp_devices=1,
+    ),
 
     #
     # RoboArena configs.
