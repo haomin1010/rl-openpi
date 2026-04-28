@@ -28,16 +28,28 @@ def _to_hwc_uint8(img) -> np.ndarray:
     return arr
 
 
-def _build_episode_frame_rows(ds) -> dict[int, list[tuple[int, int]]]:
-    out: dict[int, list[tuple[int, int]]] = {}
-    for i in range(len(ds)):
-        item = ds[i]
-        ep = int(item["episode_index"])
-        fi = int(item["frame_index"])
-        out.setdefault(ep, []).append((i, fi))
-    for ep in out:
-        out[ep].sort(key=lambda x: x[1])
-    return out
+def _load_episode_rows_from_meta(dataset_root: pathlib.Path) -> tuple[dict[int, list[tuple[int, int]]], dict[int, int]]:
+    episodes_path = dataset_root / "meta" / "episodes.jsonl"
+    if not episodes_path.exists():
+        raise FileNotFoundError(f"Missing episodes metadata: {episodes_path}")
+
+    ep_rows: dict[int, list[tuple[int, int]]] = {}
+    lengths: dict[int, int] = {}
+    next_ds_idx = 0
+
+    with episodes_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            ep = int(rec["episode_index"])
+            length = int(rec["length"])
+            lengths[ep] = length
+            ep_rows[ep] = [(next_ds_idx + frame_idx, frame_idx) for frame_idx in range(length)]
+            next_ds_idx += length
+
+    return ep_rows, lengths
 
 
 def _export_episode_images(ds, rows: list[tuple[int, int]], *, image_key: str, out_dir: pathlib.Path) -> None:
@@ -51,17 +63,6 @@ def _export_episode_images(ds, rows: list[tuple[int, int]], *, image_key: str, o
         if out_path.exists():
             continue
         cv2.imwrite(str(out_path), img[:, :, ::-1])
-
-
-def _episode_lengths(ds) -> dict[int, int]:
-    out: dict[int, int] = {}
-    for i in range(len(ds)):
-        item = ds[i]
-        ep = int(item["episode_index"])
-        out[ep] = out.get(ep, 0) + 1
-    return out
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description="Interactive keyframe annotation tool for local LeRobot datasets.")
     p.add_argument("--dataset_root", type=str, required=True)
@@ -77,9 +78,9 @@ def main() -> None:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
     ensure_local_hf_cache()
-    ds = LeRobotDataset(repo_id=args.repo_id, root=args.dataset_root)
-    ep_rows = _build_episode_frame_rows(ds)
-    lengths = _episode_lengths(ds)
+    dataset_root = pathlib.Path(args.dataset_root).resolve()
+    ep_rows, lengths = _load_episode_rows_from_meta(dataset_root)
+    ds = LeRobotDataset(repo_id=args.repo_id, root=dataset_root)
     ep_ids = sorted(lengths.keys())
     if args.end_episode >= 0:
         ep_ids = [e for e in ep_ids if args.start_episode <= e <= args.end_episode]
@@ -91,7 +92,7 @@ def main() -> None:
         with out_path.open("r", encoding="utf-8") as f:
             result = json.load(f)
     else:
-        result = {"dataset_root": args.dataset_root, "repo_id": args.repo_id, "episodes": {}}
+        result = {"dataset_root": str(dataset_root), "repo_id": args.repo_id, "episodes": {}}
 
     print("Enter comma-separated frame indices, e.g. 10,32,64. Empty = no keyframes. 'q' to quit.")
     for ep in ep_ids:

@@ -39,6 +39,7 @@ def create_empty_dataset(
     robot_type: str,
     mode: Literal["video", "image"] = "video",
     *,
+    representation: Literal["ee_delta", "joint"] = "ee_delta",
     has_velocity: bool = False,
     has_effort: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
@@ -59,6 +60,40 @@ def create_empty_dataset(
         "right_wrist_rotate",
         "right_gripper",
     ]
+    ee_state_names = [
+        "left_x",
+        "left_y",
+        "left_z",
+        "left_rotvec_x",
+        "left_rotvec_y",
+        "left_rotvec_z",
+        "left_gripper",
+        "right_x",
+        "right_y",
+        "right_z",
+        "right_rotvec_x",
+        "right_rotvec_y",
+        "right_rotvec_z",
+        "right_gripper",
+    ]
+    ee_action_names = [
+        "left_dx",
+        "left_dy",
+        "left_dz",
+        "left_drotvec_x",
+        "left_drotvec_y",
+        "left_drotvec_z",
+        "left_gripper_target",
+        "right_dx",
+        "right_dy",
+        "right_dz",
+        "right_drotvec_x",
+        "right_drotvec_y",
+        "right_drotvec_z",
+        "right_gripper_target",
+    ]
+    state_names = ee_state_names if representation == "ee_delta" else motors
+    action_names = ee_action_names if representation == "ee_delta" else motors
 
     cameras = [
         "cam_high",
@@ -71,14 +106,14 @@ def create_empty_dataset(
             "dtype": "float32",
             "shape": (len(motors), ),
             "names": [
-                motors,
+                state_names,
             ],
         },
         "action": {
             "dtype": "float32",
             "shape": (len(motors), ),
             "names": [
-                motors,
+                action_names,
             ],
         },
     }
@@ -252,6 +287,7 @@ def port_aloha(
     push_to_hub: bool = False,
     is_mobile: bool = False,
     mode: Literal["video", "image"] = "image",
+    representation: Literal["ee_delta", "joint"] = "ee_delta",
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
     if (HF_LEROBOT_HOME / repo_id).exists():
@@ -271,6 +307,7 @@ def port_aloha(
         repo_id,
         robot_type="mobile_aloha" if is_mobile else "aloha",
         mode=mode,
+        representation=representation,
         has_effort=has_effort(hdf5_files),
         has_velocity=has_velocity(hdf5_files),
         dataset_config=dataset_config,

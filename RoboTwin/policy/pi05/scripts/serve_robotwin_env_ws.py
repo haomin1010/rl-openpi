@@ -937,7 +937,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lerobot_repo_id", type=str, default="lerobot-hammer-online")
     parser.add_argument("--lerobot_fps", type=int, default=50)
     parser.add_argument("--lerobot_overwrite", action="store_true")
-    parser.add_argument("--control_mode", type=str, default="qpos", choices=("qpos", "ee_delta"))
+    parser.add_argument("--control_mode", type=str, default="ee_delta", choices=("qpos", "ee_delta"))
     parser.add_argument(
         "--lerobot_resize_to_640x480",
         action=argparse.BooleanOptionalAction,

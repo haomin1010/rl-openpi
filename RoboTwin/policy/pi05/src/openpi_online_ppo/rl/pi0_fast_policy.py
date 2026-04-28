@@ -87,6 +87,19 @@ class Pi0FastRLPolicy:
         batched = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], transformed)
         return _model.Observation.from_dict(batched), transformed
 
+    def _prepare_observations(self, obs_batch: list[dict[str, Any]]) -> tuple[_model.Observation, list[dict[str, Any]]]:
+        if not obs_batch:
+            raise ValueError("obs_batch must not be empty.")
+        transformed_batch = []
+        for obs in obs_batch:
+            inputs = jax.tree.map(lambda x: x, obs)
+            transformed_batch.append(self._input_transform(inputs))
+        batched = jax.tree.map(
+            lambda *xs: jnp.asarray(np.stack([np.asarray(x) for x in xs], axis=0)),
+            *transformed_batch,
+        )
+        return _model.Observation.from_dict(batched), transformed_batch
+
     @staticmethod
     def _truncate_by_mask(tokens: np.ndarray, token_mask: np.ndarray | None) -> np.ndarray:
         toks = np.asarray(tokens, dtype=np.int32).reshape(-1)
@@ -177,6 +190,11 @@ class Pi0FastRLPolicy:
         value = self._model.predict_value(observation)[0]
         return float(np.asarray(value))
 
+    def predict_value_batch(self, obs_batch: list[dict[str, Any]]) -> np.ndarray:
+        observation, _ = self._prepare_observations(obs_batch)
+        values = self._model.predict_value(observation)
+        return np.asarray(values, dtype=np.float32)
+
     def transform_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
         """Apply policy input transforms and return unbatched model-ready observation dict."""
         _, transformed = self._prepare_observation(obs)
@@ -186,6 +204,11 @@ class Pi0FastRLPolicy:
         observation, _ = self._prepare_observation(obs)
         prob = self._model.predict_keyframe_prob(observation, stop_gradient=True)[0]
         return float(np.asarray(prob))
+
+    def predict_keyframe_prob_batch(self, obs_batch: list[dict[str, Any]]) -> np.ndarray:
+        observation, _ = self._prepare_observations(obs_batch)
+        probs = self._model.predict_keyframe_prob(observation, stop_gradient=True)
+        return np.asarray(probs, dtype=np.float32)
 
     def recompute_token_stats(
         self,

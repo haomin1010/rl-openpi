@@ -42,10 +42,20 @@ def _parse_dim_list(raw: str | None) -> tuple[int, ...] | None:
     return tuple(out) if out else None
 
 
+def _resolve_policy_config_name(raw_name: str, policy_path: str) -> str:
+    name = str(raw_name).strip()
+    if name and name != "auto":
+        return name
+    policy_path_l = str(policy_path).lower()
+    if "ee_delta" in policy_path_l:
+        return "pi0_fast_aloha_robotwin_ppo_ee_delta"
+    return "pi0_fast_aloha_robotwin_ppo"
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--policy.path", dest="policy_path", type=str, required=True)
-    p.add_argument("--policy.config", dest="policy_config", type=str, default="pi0_fast_aloha_robotwin_ppo")
+    p.add_argument("--policy.config", dest="policy_config", type=str, default="auto")
 
     p.add_argument("--env.ws_url", dest="env_ws_url", type=str, default="ws://127.0.0.1:8765")
     p.add_argument("--env.task", dest="env_task", type=str, default=None)
@@ -83,11 +93,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fixed_reward", type=float, default=0.0)
     p.add_argument("--reward_mode", type=str, default="env_chunk", choices=("env_chunk", "fixed"))
 
-    # User decision: keyframe exploration always on.
+    # Default to pure-policy rollout unless exploration is explicitly enabled.
     p.add_argument(
         "--explore_mode",
         type=str,
-        default="always",
+        default="never",
         choices=("always", "conditional_keyframe", "never"),
     )
     p.add_argument("--explore_keyframe_threshold", type=float, default=0.5)
@@ -194,7 +204,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     collect_only = int(args.ppo_epochs) <= 0 and int(args.value_epochs) <= 0
-    cfg = train_config.get_config(args.policy_config)
+    policy_config_name = _resolve_policy_config_name(args.policy_config, args.policy_path)
+    cfg = train_config.get_config(policy_config_name)
     if collect_only:
         cfg = _to_rollout_only_config(
             cfg,

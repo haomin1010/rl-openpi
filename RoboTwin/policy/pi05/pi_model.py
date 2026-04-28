@@ -26,10 +26,13 @@ import os
 
 class PI0:
 
-    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step):
+    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step, control_mode="ee_delta"):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
+        self.control_mode = str(control_mode)
+        self.left_ref_quat = None
+        self.right_ref_quat = None
 
         specified_path = f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}/assets/"
         entries = os.listdir(specified_path)

@@ -11,6 +11,7 @@ train_config_name: null
 model_name: null
 checkpoint_id: 30000
 pi0_step: 50
+control_mode: ee_delta
 
 # Remote openpi websocket policy server.
 ws_host: 127.0.0.1

@@ -78,6 +78,16 @@ def main(usr_args):
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
+    control_mode = str(usr_args.get("control_mode", "qpos")).strip().lower()
+    if control_mode == "auto":
+        train_config_name = str(usr_args.get("train_config_name", "")).lower()
+        model_name = str(usr_args.get("model_name", "")).lower()
+        control_mode = "ee_delta" if ("ee_delta" in train_config_name or "ee_delta" in model_name) else "qpos"
+    if control_mode == "ee_delta":
+        data_type = dict(args.get("data_type", {}))
+        data_type["endpose"] = True
+        args["data_type"] = data_type
+
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
