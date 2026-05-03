@@ -23,6 +23,8 @@ class ChunkSample:
     sampled_dct_coeffs: np.ndarray | None = None
     executed_dct_coeffs: np.ndarray | None = None
     keyframe_prob: float | None = None
+    phase_class: int | None = None
+    next_phase_class: int | None = None
     exploration_applied: bool = False
     bootstrap_mask: float = 1.0
     advantage: float | None = None

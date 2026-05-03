@@ -26,6 +26,8 @@ from openpi_online_ppo.rl.reward_value import EnvChunkRewardProvider
 from openpi_online_ppo.rl.reward_value import FixedRewardProvider
 from openpi_online_ppo.rl.value_ws_client import ValueWebsocketClient
 
+KEYFRAME_NUM_BINS = 16
+
 
 def _parse_dim_list(raw: str | None) -> tuple[int, ...] | None:
     if raw is None:
@@ -109,7 +111,7 @@ def _parse_args() -> argparse.Namespace:
         "--explore_perturb_backend",
         type=str,
         default="dct_gaussian",
-        choices=("dct_gaussian", "dct_network", "action_formula", "action_network", "action_hybrid"),
+        choices=("dct_gaussian", "dct_network", "dct_sigma_network", "action_formula", "action_network", "action_hybrid"),
     )
     p.add_argument("--explore_action_radius_min", type=float, default=0.0)
     p.add_argument("--explore_action_radius_max", type=float, default=0.15)
@@ -145,7 +147,7 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
         fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
         use_value_head=True,
         use_keyframe_head=True,
-        keyframe_num_bins=max(2, int(base.action_horizon) // 2),
+        keyframe_num_bins=KEYFRAME_NUM_BINS,
     )
     return dataclasses.replace(cfg, model=rl_model)
 
@@ -169,7 +171,7 @@ def _to_rollout_only_config(
         fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
         use_value_head=False,
         use_keyframe_head=bool(enable_model_head_keyframe),
-        keyframe_num_bins=max(2, int(base.action_horizon) // 2),
+        keyframe_num_bins=KEYFRAME_NUM_BINS,
     )
     return dataclasses.replace(cfg, model=rollout_model)
 
@@ -287,6 +289,7 @@ def main() -> None:
         exploration_config=exploration_cfg,
         dct_noise_fn=noise_fn,
         keyframe_prob_fn=keyframe_prob_fn,
+        perturb_net=perturb_net,
     )
     policy_holder["policy"] = policy
 

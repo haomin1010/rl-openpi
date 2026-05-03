@@ -11,8 +11,17 @@ def compute_chunk_td_targets(samples: list[ChunkSample], gamma: float) -> None:
         value = float(sample.value)
         next_value = float(sample.next_value)
         bootstrap_mask = float(sample.bootstrap_mask)
-        sample.advantage = reward + gamma * bootstrap_mask * next_value - value
-        sample.value_target = reward + gamma * bootstrap_mask * next_value
+        phase_bootstrap_mask = 0.0
+        if (
+            sample.phase_class is not None
+            and sample.next_phase_class is not None
+            and int(sample.phase_class) > 0
+            and int(sample.phase_class) == int(sample.next_phase_class)
+        ):
+            phase_bootstrap_mask = 1.0
+        effective_bootstrap = bootstrap_mask * phase_bootstrap_mask
+        sample.advantage = reward + gamma * effective_bootstrap * next_value - value
+        sample.value_target = reward + gamma * effective_bootstrap * next_value
 
 
 def normalize_advantages(samples: list[ChunkSample], eps: float = 1e-8) -> None:
@@ -26,4 +35,3 @@ def normalize_advantages(samples: list[ChunkSample], eps: float = 1e-8) -> None:
         centered = (adv - float(np.mean(adv))) / (std + eps)
     for sample, norm_adv in zip(samples, centered, strict=True):
         sample.advantage = float(norm_adv)
-

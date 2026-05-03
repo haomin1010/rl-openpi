@@ -22,6 +22,8 @@ from openpi_online_ppo.models import pi0_fast_rl as _rl_pi0_fast
 from openpi_online_ppo.rl.pi0_value_policy import create_pi0_value_policy
 from openpi_online_ppo.rl.pi0_fast_policy import create_trained_pi0_fast_rl_policy
 
+KEYFRAME_NUM_BINS = 16
+
 
 def _resolve_policy_config_name(raw_name: str, policy_path: str) -> str:
     name = str(raw_name).strip()
@@ -46,7 +48,7 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
             use_value_head=True,
             use_keyframe_head=True,
-            keyframe_num_bins=max(2, int(base.action_horizon) // 2),
+            keyframe_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     if hasattr(base, "pi05") and hasattr(base, "action_dim") and hasattr(base, "action_horizon"):
@@ -61,7 +63,7 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             discrete_state_input=base.discrete_state_input,
             use_value_head=True,
             use_keyframe_head=True,
-            keyframe_num_bins=max(2, int(base.action_horizon) // 2),
+            keyframe_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     raise TypeError(f"Config `{cfg.name}` is not compatible with value/keyframe overlay rendering.")

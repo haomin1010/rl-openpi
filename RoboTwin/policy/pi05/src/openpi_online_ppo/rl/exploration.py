@@ -29,6 +29,7 @@ class KeyframeExplorationConfig:
     # - "action_formula": isotropic action-space perturbation with bounded radius
     # - "action_network": linear network predicts direction/scale in action space
     # - "action_hybrid": formula + network mixture
+    # - "dct_sigma_network": per-dimension diagonal Gaussian in DCT space
     perturb_backend: str = "dct_gaussian"
 
     # Action-space magnitude constraints (for action_* backends).
@@ -245,7 +246,159 @@ class DirectionRadiusActionPerturbNet:
 
 
 def load_action_perturb_net(path: str | pathlib.Path) -> DirectionRadiusActionPerturbNet:
-    return DirectionRadiusActionPerturbNet.load(path)
+    ckpt_path = pathlib.Path(path)
+    with ckpt_path.open("rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid perturb net checkpoint format at `{path}`.")
+    model_type = str(payload.get("model_type", ""))
+    if model_type == "direction_radius_mlp_jax_v1":
+        return DirectionRadiusActionPerturbNet.load(path)
+    if model_type == "dimwise_diag_gaussian_dct_v1":
+        return DimwiseDiagGaussianDCTPerturbNet.load(path)
+    raise ValueError(f"Unsupported perturb net checkpoint `{path}` model_type={model_type}.")
+
+
+class DimwiseDiagGaussianDCTPerturbNet:
+    """Per-action-dimension diagonal Gaussian perturbation net in DCT space."""
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        chunk_size: int,
+        in_dim: int,
+        hidden_dim: int,
+        hidden_depth: int,
+        out_dim: int,
+        layers: list[dict[str, np.ndarray]],
+        x_mean: np.ndarray | None,
+        x_std: np.ndarray | None,
+        dct_scale: float,
+        action_delta_limit: float,
+        sigma_min: float,
+        sigma_max: float,
+        action_noise_dims: tuple[int, ...] | None,
+        noise_dct_keep_k: int = 0,
+    ) -> None:
+        self.action_dim = int(action_dim)
+        self.chunk_size = int(chunk_size)
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.hidden_depth = int(hidden_depth)
+        self.out_dim = int(out_dim)
+        self.layers = [
+            {
+                "w": np.asarray(layer["w"], dtype=np.float32),
+                "b": np.asarray(layer["b"], dtype=np.float32),
+            }
+            for layer in layers
+        ]
+        self.x_mean = np.asarray(x_mean, dtype=np.float32).reshape(1, -1) if x_mean is not None else None
+        self.x_std = np.asarray(x_std, dtype=np.float32).reshape(1, -1) if x_std is not None else None
+        self.dct_scale = float(dct_scale)
+        self.action_delta_limit = float(action_delta_limit)
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        self.action_noise_dims = tuple(int(x) for x in action_noise_dims) if action_noise_dims is not None else None
+        self.noise_dct_keep_k = int(noise_dct_keep_k) if int(noise_dct_keep_k) > 0 else int(chunk_size)
+        self._dct_mat = _build_ortho_dct_matrix(self.chunk_size)
+
+    @classmethod
+    def load(cls, path: str | pathlib.Path) -> "DimwiseDiagGaussianDCTPerturbNet":
+        ckpt_path = pathlib.Path(path)
+        with ckpt_path.open("rb") as f:
+            payload = pickle.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid perturb net checkpoint format at `{path}`.")
+        model_type = str(payload.get("model_type", ""))
+        if model_type != "dimwise_diag_gaussian_dct_v1":
+            raise ValueError(f"Unsupported perturb net checkpoint `{path}` model_type={model_type}.")
+        meta = dict(payload.get("meta", {}))
+        layers = payload.get("layers")
+        if not isinstance(layers, list) or len(layers) == 0:
+            raise ValueError(f"Invalid layers in perturb net checkpoint `{path}`.")
+        raw_noise_dims = meta.get("action_noise_dims")
+        return cls(
+            action_dim=int(meta["action_dim"]),
+            chunk_size=int(meta["chunk_size"]),
+            in_dim=int(meta["in_dim"]),
+            hidden_dim=int(meta["hidden_dim"]),
+            hidden_depth=int(meta["hidden_depth"]),
+            out_dim=int(meta["out_dim"]),
+            layers=layers,
+            x_mean=np.asarray(payload.get("x_mean"), dtype=np.float32) if payload.get("x_mean") is not None else None,
+            x_std=np.asarray(payload.get("x_std"), dtype=np.float32) if payload.get("x_std") is not None else None,
+            dct_scale=float(meta.get("dct_scale", 1.0)),
+            action_delta_limit=float(meta.get("action_delta_limit", 0.0)),
+            sigma_min=float(meta.get("sigma_min", 1e-4)),
+            sigma_max=float(meta.get("sigma_max", 1.0)),
+            action_noise_dims=tuple(int(x) for x in raw_noise_dims) if raw_noise_dims is not None else None,
+            noise_dct_keep_k=int(meta.get("noise_dct_keep_k", 0)),
+        )
+
+    def _mlp(self, x: np.ndarray) -> np.ndarray:
+        h = np.asarray(x, dtype=np.float32).reshape(-1)
+        if h.shape[0] != self.in_dim:
+            raise ValueError(f"network input dim mismatch: got {h.shape[0]}, expect {self.in_dim}")
+        if self.x_mean is not None and self.x_std is not None:
+            h = ((h.reshape(1, -1) - self.x_mean) / (self.x_std + 1e-6)).reshape(-1)
+        for i, layer in enumerate(self.layers):
+            h = h @ layer["w"] + layer["b"]
+            if i < len(self.layers) - 1:
+                h = _gelu(h)
+        return h.astype(np.float32)
+
+    def _sigma_from_logits(self, logits: np.ndarray) -> np.ndarray:
+        x = np.asarray(logits, dtype=np.float32)
+        # Numerically stable softplus: max(x, 0) + log1p(exp(-abs(x))).
+        sigma = np.maximum(x, 0.0) + np.log1p(np.exp(-np.abs(x)))
+        sigma = sigma + float(self.sigma_min)
+        if self.sigma_max > 0:
+            sigma = np.clip(sigma, self.sigma_min, self.sigma_max)
+        return sigma.astype(np.float32)
+
+    def _allowed_dims(self, action_dim: int, cfg_allowed: tuple[int, ...] | None) -> list[int]:
+        allowed = cfg_allowed if cfg_allowed is not None else self.action_noise_dims
+        if allowed is None:
+            return list(range(int(action_dim)))
+        out: list[int] = []
+        for idx in allowed:
+            i = int(idx)
+            if 0 <= i < int(action_dim):
+                out.append(i)
+        return sorted(set(out))
+
+    def sample_delta_dct(
+        self,
+        *,
+        dct_coeffs: np.ndarray,
+        action_noise_dims: tuple[int, ...] | None = None,
+    ) -> np.ndarray:
+        coeffs = np.asarray(dct_coeffs, dtype=np.float32)
+        if coeffs.ndim != 2:
+            raise ValueError(f"Expected dct_coeffs [T,A], got {coeffs.shape}")
+        t, a = coeffs.shape
+        if t != self.chunk_size or a != self.action_dim:
+            raise ValueError(f"DCT shape mismatch for sigma net. Got {(t, a)}, expect {(self.chunk_size, self.action_dim)}")
+        delta = np.zeros_like(coeffs, dtype=np.float32)
+        allowed_dims = self._allowed_dims(a, action_noise_dims)
+        for dim_idx in allowed_dims:
+            dim_onehot = np.zeros((self.action_dim,), dtype=np.float32)
+            dim_onehot[int(dim_idx)] = 1.0
+            x = np.concatenate([coeffs[:, int(dim_idx)], dim_onehot], axis=0)
+            sigma = self._sigma_from_logits(self._mlp(x))
+            if self.noise_dct_keep_k < self.chunk_size:
+                sigma = sigma.copy()
+                sigma[self.noise_dct_keep_k :] = 0.0
+            eps = np.random.normal(0.0, 1.0, size=(self.chunk_size,)).astype(np.float32)
+            delta[:, int(dim_idx)] = sigma * eps
+
+        if self.action_delta_limit > 0:
+            delta_action = self._dct_mat.T @ (delta / max(self.dct_scale, 1e-6))
+            delta_action = np.clip(delta_action, -float(self.action_delta_limit), float(self.action_delta_limit))
+            delta = (self._dct_mat @ delta_action * float(self.dct_scale)).astype(np.float32)
+        return np.asarray(delta, dtype=np.float32)
 
 
 def _extract_obs_by_dotted_key(obs: dict[str, Any], dotted_key: str) -> np.ndarray:
@@ -367,7 +520,7 @@ def default_dct_noise(
     For action-space backends this expects metadata to provide:
     - `decode_dct_to_actions`: Callable[[np.ndarray], np.ndarray]
     - `encode_actions_to_dct`: Callable[[np.ndarray], np.ndarray]
-    - optional `perturb_net`: LinearActionPerturbNet
+    - optional `perturb_net`: perturbation model checkpoint
     """
 
     cfg = cfg or KeyframeExplorationConfig()
@@ -380,6 +533,16 @@ def default_dct_noise(
         dims = min(int(num_noisy_dims), coeffs.shape[-1])
         coeffs[..., :dims] += np.random.normal(0.0, noise_std, size=coeffs[..., :dims].shape).astype(np.float32)
         return coeffs
+
+    if backend == "dct_sigma_network":
+        sigma_net: DimwiseDiagGaussianDCTPerturbNet | None = metadata.get("perturb_net") if metadata is not None else None
+        if sigma_net is None:
+            return coeffs
+        delta_dct = sigma_net.sample_delta_dct(
+            dct_coeffs=coeffs,
+            action_noise_dims=getattr(cfg, "action_noise_indices", None),
+        )
+        return np.asarray(coeffs + delta_dct, dtype=np.float32)
 
     metadata = metadata or {}
     decode_fn = metadata.get("decode_dct_to_actions")

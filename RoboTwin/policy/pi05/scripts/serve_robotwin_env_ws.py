@@ -480,6 +480,7 @@ class RoboTwinEnvSession:
         task_name: str,
         task_config: str,
         default_prompt: str | None,
+        force_default_prompt: bool,
         seed_start: int,
         instruction_type: str,
         prompt_max_descriptions: int,
@@ -498,6 +499,7 @@ class RoboTwinEnvSession:
         self._task_name = task_name
         self._task_config = task_config
         self._default_prompt = default_prompt
+        self._force_default_prompt = bool(force_default_prompt)
         self._next_seed = int(seed_start)
         self._episode_id = 0
         self._instruction_type = instruction_type
@@ -699,6 +701,9 @@ class RoboTwinEnvSession:
         if user_prompt is not None:
             seed = start_seed
             prompt = str(user_prompt)
+        elif self._force_default_prompt and self._default_prompt is not None:
+            seed = start_seed
+            prompt = str(self._default_prompt)
         else:
             seed = start_seed
             prompt = None
@@ -927,6 +932,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--task_config", type=str, required=True)
     parser.add_argument("--repo_root", type=str, default=None)
     parser.add_argument("--default_prompt", type=str, default=None)
+    parser.add_argument(
+        "--force_default_prompt",
+        action="store_true",
+        help="Always use --default_prompt for every reset instead of generating prompt text from the episode seed.",
+    )
     parser.add_argument("--instruction_type", type=str, default="unseen")
     parser.add_argument("--prompt_max_descriptions", type=int, default=100)
     parser.add_argument("--prompt_seed_max_tries", type=int, default=64)
@@ -965,6 +975,7 @@ def main() -> None:
         task_name=args.task_name,
         task_config=args.task_config,
         default_prompt=args.default_prompt,
+        force_default_prompt=args.force_default_prompt,
         instruction_type=args.instruction_type,
         prompt_max_descriptions=args.prompt_max_descriptions,
         prompt_seed_max_tries=args.prompt_seed_max_tries,

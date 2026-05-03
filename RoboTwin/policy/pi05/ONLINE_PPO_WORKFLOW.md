@@ -104,33 +104,27 @@ Current behavior:
 
 ## 2. Train Value Head And Keyframe Head
 
-### 2.1 Annotate keyframes
+### 2.1 Annotate keyphases
 
-Use the interactive annotation script:
+`keyphases.json` is now the single source of truth for both heads:
+
+- keyframe head:
+  predicts phase class, where `0 = none` and `1..K = annotated phase names`
+- value head:
+  trains a phase-conditioned phase-success target
+
+Use:
 
 ```bash
-scripts/annotate_keyframes_lerobot.py
+scripts/annotate_keyphases_lerobot.py
 ```
 
-This script will iterate episode by episode and ask you to enter comma-separated frame indices.
-
-Example interaction:
+Input format is one line per episode:
 
 ```text
-[episode 12] num_frames=116 keyframes> 18,42,71
+phase names (comma-separated, e.g. pick, put)> pick, put
+[episode 12] num_frames=116 keyphases> 1:20-30,2:60-70
 ```
-
-Meaning:
-
-- frame `18` is marked as a keyframe
-- frame `42` is marked as a keyframe
-- frame `71` is marked as a keyframe
-
-Useful input rules:
-
-- empty input means this episode has no keyframes
-- `q` / `quit` / `exit` stops annotation early
-- the script saves incrementally after each episode
 
 Output format:
 
@@ -139,33 +133,30 @@ Output format:
   "dataset_root": "...",
   "repo_id": "...",
   "episodes": {
-    "0": [12, 25, 44],
-    "1": [],
-    "2": [31]
+    "12": [
+      {"name": "pick_object", "start": 20, "end": 30},
+      {"name": "place_object", "start": 60, "end": 70}
+    ]
   }
 }
 ```
 
-If you want the script to export per-frame images for easier manual inspection, pass `--extract_images`.
+Recommended command:
 
 ```bash
-uv run python scripts/annotate_keyframes_lerobot.py \
+uv run python scripts/annotate_keyphases_lerobot.py \
   --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
   --repo_id lerobot_ppo_corpus \
-  --out /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyframes.json \
+  --out /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
   --extract_images
 ```
 
-Quick smoke test:
+Important semantics:
 
-```bash
-uv run python scripts/annotate_keyframes_lerobot.py \
-  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
-  --repo_id lerobot_ppo_corpus \
-  --out /mnt/data1/tmp/pi05_keyframes_smoke.json \
-  --start_episode 0 \
-  --end_episode 0
-```
+- the first prompt defines the phase-name vocabulary for this dataset
+- later episodes use only index syntax like `1:20-30,2:60-70`
+- annotation resumes from the same `--out` file if you stop and restart
+- frames after the last annotated phase in an episode are excluded from keyframe training
 
 ### 2.2 Start value websocket service
 
@@ -189,11 +180,11 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/serve_value_mc_ws.py \
   --policy.config pi05_aloha_full_base_ee \
   --host 127.0.0.1 \
   --port 8877 \
-  --mc_epochs 1 \
+  --mc_epochs 5 \
   --mc_batch_size 32 \
   --num_workers 8 \
   --persistent_workers true \
-  --keyframe_epochs 3 \
+  --keyframe_epochs 5 \
   --keyframe_batch_size 64 \
   --keyframe_chunk_size 32 \
   --value_target_mode evorl_normalized \
@@ -229,17 +220,42 @@ Notes:
 - The saved `state_ckpt_dir/latest.pkl` is backbone-specific.
   Do not mix a `pi05` value/keyframe state file with a `pi0_fast` service, or vice versa.
 
-### 2.3 Train keyframe head
+### 2.3 Train keyframe head and value head together
+
+```bash
+uv run python scripts/trigger_value_and_keyframe_train_ws.py \
+  --ws_url ws://127.0.0.1:8877 \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json
+```
+
+This single request runs:
+
+- keyframe / phase-class training first
+- phase-conditioned value training second
+
+Current keyframe-head semantics:
+
+- class `0`: not inside any annotated keyphase
+- class `1..K`: inside the corresponding annotated phase
+- online `keyframe_prob` is interpreted as `P(class > 0)`
+
+### 2.4 Optional separate triggers
+
+If you want to rerun only one side, the separate triggers still exist.
+
+Keyframe only:
 
 ```bash
 uv run python scripts/trigger_keyframe_train_ws.py \
   --ws_url ws://127.0.0.1:8877 \
   --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
   --repo_id lerobot_ppo_corpus \
-  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyframes.json
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json
 ```
 
-### 2.4 Train value head
+Value only, whole-episode target:
 
 ```bash
 uv run python scripts/trigger_value_mc_train_ws.py \
@@ -247,6 +263,27 @@ uv run python scripts/trigger_value_mc_train_ws.py \
   --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
   --repo_id lerobot_ppo_corpus
 ```
+
+Optional phase-conditioned value training:
+
+```bash
+uv run python scripts/trigger_value_mc_train_ws.py \
+  --ws_url ws://127.0.0.1:8877 \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json
+```
+
+Value-training notes:
+
+- When `--annotations_json` is provided, value training switches from whole-episode targets to annotated phase targets.
+- Samples from phases with the same `name` are trained together by conditioning the value input prompt on `current phase: <name>`.
+- The value target is phase-success, not phase-progress:
+  - success trajectories: every annotated phase gets the success target
+  - failure trajectories: only the last annotated phase gets the failure target
+  - earlier phases in a failed trajectory still get the success target
+- This means similar-looking frames are no longer forced to regress different values just because they appear at different positions inside the same phase.
+- This change only affects value-head training. The action-policy prompt path used by `train_pi0_fast_online_v2.py` is unchanged.
 
 ### 2.5 Visualize value / keyframe predictions
 
@@ -267,6 +304,17 @@ uv run python scripts/render_value_overlay_lerobot.py \
   --curves both \
   --episodes 0,1,2 \
   --out_dir /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/value_overlay
+```
+
+```bash
+uv run python scripts/render_keyframe_future_value_overlay.py \
+  --policy.config pi05_aloha_full_base_ee \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
+  --value_state_file /mnt/data1/tmp/pi05_value_state_1/latest.pkl \
+  --episodes 0,1,2，100,101,105 \
+  --out_dir /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/future_value_overlay
 ```
 
 Notes:
@@ -301,9 +349,15 @@ Current recommended script:
 scripts/fit_exploration_net_nll_lerobot.py
 ```
 
+Alternative dimwise sigma-network script:
+
+```bash
+scripts/fit_dimwise_sigma_net_lerobot.py
+```
+
 Recommended idea:
 
-1. Use keyframe annotations to select meaningful chunks
+1. Use keyphase annotations to select meaningful chunks
 2. Build clean action chunks from dataset
 3. Add perturbation only on selected action dims
 4. Convert perturbed chunk to DCT target
@@ -322,7 +376,7 @@ That means:
 
 Training command:
 
-```bash
+<!-- ```bash
 uv run python scripts/fit_exploration_net_nll_lerobot.py \
   --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
   --repo_id lerobot_ppo_corpus \
@@ -352,14 +406,69 @@ uv run python scripts/fit_exploration_net_nll_lerobot.py \
   --action_noise_dims "0,1,2,7,8,9" \
   --epochs 1 \
   --batch_size 2 \
-  --max_chunks 4
+  --max_chunks 4 -->
+```
+
+Dimwise sigma-network example:
+
+```bash
+uv run python scripts/fit_dimwise_sigma_net_lerobot.py \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
+  --out checkpoints/explored_net/dimwise_sigma_dct.pkl \
+  --chunk_size 32 \
+  --action_noise_dims "0,1,2,3,4,5,6" \
+  --action_delta_limit 0.1 \
+  --noise_dct_keep_k 4
+  --epochs 100 \
+  --batch_size 128
 ```
 
 Output checkpoint example:
 
 ```text
-checkpoints/explored_net/explore_dir_radius_nll.pkl
+checkpoints/explored_net/dimwise_sigma_dct.pkl
 ```
+
+Recommended sanity-check before online PPO:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/analyze_dimwise_sigma_net_lerobot.py \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
+  --net checkpoints/explored_net/dimwise_sigma_dct.pkl \
+  --chunk_size 32 \
+  --action_noise_dims "0,1,2,3,4,5,6" \
+  --num_samples_per_chunk 64 \
+  --out_json checkpoints/explored_net/dimwise_sigma_dct_analysis.json
+```
+
+Compare explored action in videos:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/compare_sigma_rollout_videos.py \
+  --policy.path checkpoints/pi0_fast_aloha_robotwin_full_ee_delta/beat_block_hammer_pi0fast_full_ee_delta/30000/ \
+  --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
+  --env.ws_url ws://127.0.0.1:8765 \
+  --value.ws_url ws://127.0.0.1:8877 \
+  --env.seed 100000 \
+  --max_chunks 64 \
+  --seed 0 \
+  --sigma_ckpt checkpoints/explored_net/dimwise_sigma_dct.pkl \
+  --explore_mode conditional_keyframe \
+  --explore_keyframe_threshold 0.5 \
+  --explore_keyframe_gate small_net \
+  --explore_action_noise_dims "0,1,2,3,4,5,6" \
+  --out_json checkpoints/explored_net/compare_sigma_rollout_videos_ws8877.json
+```
+
+What to look for in the analysis JSON:
+
+- `pre_clip.histogram`: should cover multiple bins inside `[0, 0.03]`, not collapse only near zero or only near the upper edge.
+- `pre_clip.exceed_rate`: small tail exceedance is acceptable; the current `v2` target is neighborhood exploration, not exact hard-constraint satisfaction before clip.
+- `pre_clip.near_limit_rate_90` and `pre_clip.near_limit_rate_95`: should stay modest if you want exploration spread across the neighborhood rather than concentrated at the boundary.
 
 ## 4. Run Online PPO
 
@@ -369,7 +478,7 @@ Keep the value websocket service running from step 2.
 
 Then run PPO:
 
-```bash
+<!-- ```bash
 uv run python scripts/train_pi0_fast_online_v2.py \
   --policy.path checkpoints/pi0_fast_aloha_robotwin_full_ee_delta/beat_block_hammer_pi0fast_full_ee_delta/30000/ \
   --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
@@ -393,7 +502,37 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --explore_network_obs_dim 32 \
   --explore_network_latent_dim 16 \
   --explore_keyframe_gate model_head
+``` -->
+
+Using the dimwise sigma DCT perturbation network:
+
+```bash
+uv run python scripts/train_pi0_fast_online_v2.py \
+  --policy.path checkpoints/pi0_fast_aloha_robotwin_full_ee_delta/beat_block_hammer_pi0fast_full_ee_delta/30000/ \
+  --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
+  --env.ws_url ws://127.0.0.1:8765 \
+  --total_updates 10 \
+  --rollout_batch_size 64 \
+  --mini_batch_size 32 \
+  --ppo_epochs 1 \
+  --value_epochs 0 \
+  --value.ws_url ws://127.0.0.1:8877 \
+  --explore_mode conditional_keyframe \
+  --explore_keyframe_threshold 0.5 \
+  --explore_keyframe_gate small_net \
+  --explore_perturb_backend dct_sigma_network \
+  --explore_network_ckpt checkpoints/explored_net/dimwise_sigma_dct.pkl \
+  --explore_action_noise_dims "0,1,2,3,4,5,6"
+
 ```
+
+Notes for this sigma-net path:
+
+- `dct_sigma_network` is applied inside the row-wise rollout path.
+- With `--explore_mode conditional_keyframe`, sigma perturbation is only enabled when the predicted keyframe probability exceeds `--explore_keyframe_threshold`.
+- PPO value bootstrap is now disabled across phase switches. In practice, TD bootstrapping only happens when both the current and next frame are inside keyphases and their predicted phase classes are the same.
+- The checkpoint stores `action_delta_limit`, and the runtime sampler will still rescale a sampled chunk if any action-space perturbation exceeds that limit.
+- Current recommended checkpoint path in this workflow is `dimwise_sigma_dct.pkl`.
 
 Convenience wrapper also exists:
 

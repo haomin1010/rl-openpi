@@ -121,11 +121,18 @@ class Pi0Aux(_pi0.Pi0):
     ) -> at.Float[at.Array, "b"]:
         logits = self.predict_keyframe_logits(observation, stop_gradient=stop_gradient)
         probs = jax.nn.softmax(logits, axis=-1)
-        num_bins = logits.shape[-1]
-        dist = jnp.arange(num_bins, dtype=probs.dtype)
-        denom = jnp.maximum(jnp.asarray(num_bins - 1, dtype=probs.dtype), 1.0)
-        closeness = 1.0 - dist / denom
-        return jnp.sum(probs * closeness[None, :], axis=-1)
+        if logits.shape[-1] == 2:
+            return probs[:, 1]
+        return jnp.sum(probs[:, 1:], axis=-1)
+
+    def predict_keyframe_class(
+        self,
+        observation: _model.Observation,
+        *,
+        stop_gradient: bool = False,
+    ) -> at.Int[at.Array, "b"]:
+        logits = self.predict_keyframe_logits(observation, stop_gradient=stop_gradient)
+        return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
     def value_bin_centers(self) -> at.Float[at.Array, "bins"]:
         config = self.config

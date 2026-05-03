@@ -40,6 +40,23 @@ from openpi_online_ppo.rl.pi0_fast_policy import create_trained_pi0_fast_rl_poli
 
 log = logging.getLogger("value_mc_ws")
 
+KEYFRAME_NUM_BINS = 16
+
+
+@dataclasses.dataclass(frozen=True)
+class KeyPhaseSpan:
+    name: str
+    start: int
+    end: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PhaseTrainSample:
+    ds_index: int
+    phase_name: str
+    phase_prompt: str
+    target: float
+
 
 def _collate_tree(items):
     return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
@@ -96,6 +113,7 @@ def _build_input_transform(
     *,
     tasks: dict[int, str] | None,
     checkpoint_dir: str | None,
+    prompt_from_task: bool = True,
 ) -> _transforms.DataTransformFn:
     data_config = cfg.data.create(cfg.assets_dirs, cfg.model)
     norm_stats = data_config.norm_stats
@@ -106,7 +124,7 @@ def _build_input_transform(
             norm_stats = _checkpoints.load_norm_stats(assets_dir, data_config.asset_id)
 
     transforms: list[_transforms.DataTransformFn] = []
-    if data_config.prompt_from_task:
+    if data_config.prompt_from_task and prompt_from_task:
         if tasks is None:
             raise ValueError("Prompt-from-task transform requires dataset task metadata.")
         transforms.append(_transforms.PromptFromLeRobotTask(tasks))
@@ -120,13 +138,144 @@ def _build_input_transform(
 def _row_to_transformed_obs(
     row: dict[str, Any],
     input_transform: _transforms.DataTransformFn,
+    *,
+    prompt_override: str | None = None,
 ) -> dict[str, Any]:
     if any(k.startswith("obs_t.") for k in row.keys()):
         return _unflatten_obs_t_row_static(row)
-    obs = dict(input_transform(_row_to_worker_payload(row)))
+    row_payload = dict(row)
+    if prompt_override is not None:
+        row_payload["prompt"] = str(prompt_override)
+    obs = dict(input_transform(_row_to_worker_payload(row_payload)))
     # Observation.from_dict consumes observation-side fields only.
     obs.pop("actions", None)
     return obs
+
+
+def _normalize_phase_name(raw: Any) -> str:
+    name = str(raw).strip()
+    if not name:
+        raise ValueError("Keyphase name must be non-empty.")
+    return name
+
+
+def _parse_keyphase_frame_range(raw: Any) -> tuple[int, int]:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if "-" not in text:
+            raise ValueError(f"Invalid keyphase frame range: {raw!r}")
+        start_s, end_s = text.split("-", 1)
+        return int(start_s.strip()), int(end_s.strip())
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        return int(raw[0]), int(raw[1])
+    raise ValueError(f"Unsupported keyphase frame range format: {raw!r}")
+
+
+def _parse_keyphase_annotations(path: str | pathlib.Path) -> dict[int, list[KeyPhaseSpan]]:
+    raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    episodes_raw = raw.get("episodes", {})
+    if not isinstance(episodes_raw, dict):
+        raise ValueError("Keyphase annotations json must contain an `episodes` object.")
+
+    parsed: dict[int, list[KeyPhaseSpan]] = {}
+    for ep_key, spans_raw in episodes_raw.items():
+        ep = int(ep_key)
+        if spans_raw is None:
+            parsed[ep] = []
+            continue
+        if not isinstance(spans_raw, list):
+            raise ValueError(f"Episode {ep} keyphases must be a list.")
+        spans: list[KeyPhaseSpan] = []
+        for item in spans_raw:
+            if not isinstance(item, dict):
+                raise ValueError(f"Episode {ep} keyphase item must be an object, got {type(item).__name__}.")
+            name = _normalize_phase_name(item.get("name", ""))
+            if "start" in item or "end" in item:
+                start = int(item.get("start"))
+                end = int(item.get("end"))
+            elif "frame" in item:
+                start, end = _parse_keyphase_frame_range(item["frame"])
+            elif "frames" in item:
+                start, end = _parse_keyphase_frame_range(item["frames"])
+            else:
+                raise ValueError(f"Episode {ep} keyphase `{name}` missing start/end or frame range.")
+            if start < 0 or end < 0 or end < start:
+                raise ValueError(f"Episode {ep} keyphase `{name}` has invalid range [{start}, {end}].")
+            spans.append(KeyPhaseSpan(name=name, start=start, end=end))
+        spans.sort(key=lambda span: (span.start, span.end, span.name))
+        prev_end = -1
+        for span in spans:
+            if span.start <= prev_end:
+                raise ValueError(
+                    f"Episode {ep} keyphase spans overlap: start={span.start} previous_end={prev_end}."
+                )
+            prev_end = span.end
+        parsed[ep] = spans
+    return parsed
+
+
+def _load_keyphase_phase_names(path: str | pathlib.Path) -> list[str]:
+    raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    phase_names_raw = raw.get("phase_names", None)
+    if phase_names_raw is not None:
+        if not isinstance(phase_names_raw, list):
+            raise ValueError("Keyphase annotations `phase_names` must be a list when provided.")
+        phase_names = [_normalize_phase_name(x) for x in phase_names_raw]
+    else:
+        ann_eps = _parse_keyphase_annotations(path)
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for ep in sorted(ann_eps.keys()):
+            for span in ann_eps[ep]:
+                if span.name not in seen_set:
+                    seen.append(span.name)
+                    seen_set.add(span.name)
+        phase_names = seen
+    if not phase_names:
+        raise ValueError("Keyphase annotations contain no phase names.")
+    if len(phase_names) + 1 > KEYFRAME_NUM_BINS:
+        raise ValueError(
+            f"Need {len(phase_names) + 1} keyframe classes (including `none`), "
+            f"but KEYFRAME_NUM_BINS={KEYFRAME_NUM_BINS}."
+        )
+    return phase_names
+
+
+def _compose_phase_prompt(task_prompt: str, phase_name: str) -> str:
+    task_text = str(task_prompt).strip()
+    phase_text = _normalize_phase_name(phase_name)
+    if task_text:
+        return f"task: {task_text}; current phase: {phase_text}"
+    return f"current phase: {phase_text}"
+
+
+def _resolve_row_task_prompt(
+    *,
+    row_idx: int,
+    row: dict[str, Any],
+    tasks: dict[int, str] | None,
+    task_index_arr: np.ndarray,
+    task_name_by_idx: dict[int, str],
+) -> str:
+    task_index = int(task_index_arr[int(row_idx)])
+    if task_index >= 0 and tasks is not None:
+        prompt = tasks.get(task_index)
+        if prompt is not None:
+            return str(prompt)
+    prompt = task_name_by_idx.get(int(row_idx))
+    if prompt:
+        return str(prompt)
+    task_val = row.get("task")
+    if task_val is not None:
+        if isinstance(task_val, str):
+            return task_val
+        return str(np.asarray(task_val).item())
+    prompt_val = row.get("prompt")
+    if prompt_val is not None:
+        if isinstance(prompt_val, str):
+            return prompt_val
+        return str(np.asarray(prompt_val).item())
+    return ""
 
 
 def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConfig:
@@ -142,7 +291,7 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
             use_value_head=True,
             use_keyframe_head=True,
-            keyframe_num_bins=max(2, int(base.action_horizon) // 2),
+            keyframe_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     if isinstance(cfg.model, _base_pi0.Pi0Config):
@@ -158,7 +307,7 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             discrete_state_input=base.discrete_state_input,
             use_value_head=True,
             use_keyframe_head=True,
-            keyframe_num_bins=max(2, int(base.action_horizon) // 2),
+            keyframe_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     raise TypeError(f"Config `{cfg.name}` is not a supported Pi0FAST/Pi0/Pi05 config.")
@@ -170,18 +319,33 @@ class _LerobotTargetDataset(torch.utils.data.Dataset):
         base_ds: Any,
         input_transform: _transforms.DataTransformFn,
         targets: np.ndarray,
+        *,
+        ds_indices: np.ndarray | None = None,
+        prompt_overrides: list[str] | None = None,
     ) -> None:
         self._base_ds = base_ds
         self._input_transform = input_transform
         self._targets = np.asarray(targets)
+        self._ds_indices = (
+            np.asarray(ds_indices, dtype=np.int32)
+            if ds_indices is not None
+            else np.arange(len(self._targets), dtype=np.int32)
+        )
+        self._prompt_overrides = list(prompt_overrides) if prompt_overrides is not None else None
+        if self._targets.shape[0] != self._ds_indices.shape[0]:
+            raise ValueError("targets and ds_indices length mismatch.")
+        if self._prompt_overrides is not None and len(self._prompt_overrides) != self._targets.shape[0]:
+            raise ValueError("targets and prompt_overrides length mismatch.")
 
     def __len__(self) -> int:
-        return len(self._base_ds)
+        return int(self._targets.shape[0])
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        item = self._base_ds[int(idx)]
+        ds_idx = int(self._ds_indices[int(idx)])
+        item = self._base_ds[ds_idx]
         row = {k: item[k] for k in item.keys()}
-        obs = _row_to_transformed_obs(row, self._input_transform)
+        prompt_override = None if self._prompt_overrides is None else self._prompt_overrides[int(idx)]
+        obs = _row_to_transformed_obs(row, self._input_transform, prompt_override=prompt_override)
         return {
             "obs": obs,
             "target": np.asarray(self._targets[int(idx)]),
@@ -194,29 +358,38 @@ class _LerobotKeyframeDataset(torch.utils.data.Dataset):
         base_ds: Any,
         input_transform: _transforms.DataTransformFn,
         *,
-        ann_eps: dict[int, list[int]],
-        num_bins: int,
+        ann_eps: dict[int, list[KeyPhaseSpan]],
+        phase_to_class: dict[str, int],
+        ds_indices: np.ndarray | None = None,
     ) -> None:
         self._base_ds = base_ds
         self._input_transform = input_transform
         self._ann_eps = ann_eps
-        self._num_bins = int(num_bins)
+        self._phase_to_class = dict(phase_to_class)
+        self._ds_indices = (
+            np.asarray(ds_indices, dtype=np.int32)
+            if ds_indices is not None
+            else np.arange(len(base_ds), dtype=np.int32)
+        )
 
     def __len__(self) -> int:
-        return len(self._base_ds)
+        return int(self._ds_indices.shape[0])
 
-    def _nearest_distance_bin(self, frame_idx: int, keyframes: list[int]) -> int:
-        if not keyframes:
-            return self._num_bins - 1
-        nearest = min(abs(int(frame_idx) - int(kf)) for kf in keyframes)
-        return int(min(max(0, nearest), self._num_bins - 1))
+    def _phase_class_label(self, frame_idx: int, phases: list[KeyPhaseSpan]) -> int:
+        fi = int(frame_idx)
+        for phase in phases:
+            start = int(phase.start)
+            end = int(phase.end)
+            if start <= fi <= end:
+                return int(self._phase_to_class[str(phase.name)])
+        return 0
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        item = self._base_ds[int(idx)]
+        item = self._base_ds[int(self._ds_indices[int(idx)])]
         row = {k: item[k] for k in item.keys()}
         ep = int(np.asarray(row["episode_index"]).item())
         fi = int(np.asarray(row["frame_index"]).item())
-        label = self._nearest_distance_bin(fi, self._ann_eps.get(ep, []))
+        label = self._phase_class_label(fi, self._ann_eps.get(ep, []))
         obs = _row_to_transformed_obs(row, self._input_transform)
         return {
             "obs": obs,
@@ -401,8 +574,9 @@ class ValueMCService:
         metric_parts = []
         for key in (
             "keyframe_loss",
+            "keyframe_prob_mae",
+            "keyframe_mse",
             "keyframe_acc",
-            "keyframe_distance_mae",
             "keyframe_grad_norm",
             "value_loss",
             "value_mae",
@@ -456,16 +630,22 @@ class ValueMCService:
         def loss_fn(m):
             observation = _model.Observation.from_dict(obs_batch)
             logits = m.predict_keyframe_logits(observation, stop_gradient=False)
+            labels_i = jnp.clip(labels.astype(jnp.int32), 0, logits.shape[-1] - 1)
             log_probs = jax.nn.log_softmax(logits, axis=-1)
-            per_sample_loss = -jnp.take_along_axis(log_probs, labels[:, None], axis=-1)[:, 0]
+            per_sample_loss = -log_probs[jnp.arange(logits.shape[0]), labels_i]
             keyframe_loss = jnp.mean(per_sample_loss)
+            probs = jax.nn.softmax(logits, axis=-1)
+            pred_score = jnp.sum(probs[:, 1:], axis=-1)
+            target_score = (labels_i > 0).astype(jnp.float32)
             pred = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            acc = jnp.mean((pred == labels).astype(jnp.float32))
-            distance_mae = jnp.mean(jnp.abs(pred - labels).astype(jnp.float32))
+            acc = jnp.mean((pred == labels_i).astype(jnp.float32))
+            prob_mae = jnp.mean(jnp.abs(pred_score - target_score))
+            prob_mse = jnp.mean(jnp.square(pred_score - target_score))
             return keyframe_loss, {
                 "keyframe_loss": keyframe_loss,
+                "keyframe_prob_mae": prob_mae,
+                "keyframe_mse": prob_mse,
                 "keyframe_acc": acc,
-                "keyframe_distance_mae": distance_mae,
             }
 
         diff_state = nnx.DiffState(0, self._keyframe_filter)
@@ -581,10 +761,21 @@ class ValueMCService:
             mc_arr,
         )
 
-    def train_mc_from_lerobot(self, *, dataset_root: str, repo_id: str) -> dict[str, float]:
+    def train_mc_from_lerobot(
+        self,
+        *,
+        dataset_root: str,
+        repo_id: str,
+        annotations_json: str | None = None,
+    ) -> dict[str, float]:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
-        log.info("train_mc_from_lerobot start dataset_root=%s repo_id=%s", dataset_root, repo_id)
+        log.info(
+            "train_mc_from_lerobot start dataset_root=%s repo_id=%s annotations_json=%s",
+            dataset_root,
+            repo_id,
+            annotations_json,
+        )
         ensure_local_hf_cache()
         ds = LeRobotDataset(repo_id=repo_id, root=dataset_root)
         num_rows = len(ds)
@@ -624,16 +815,21 @@ class ValueMCService:
                     ret = np.asarray(ret, dtype=np.float32).reshape(-1)
                     mc_return_arr[i] = float(ret[0])
 
-        target_arr = np.zeros((num_rows,), dtype=np.float32)
         ep_to_indices: dict[int, list[int]] = {}
         for i in range(num_rows):
             ep_to_indices.setdefault(int(ep_arr[i]), []).append(i)
 
-        if self._value_target_mode == "evorl_normalized":
+        tasks = getattr(getattr(ds, "meta", None), "tasks", None)
+        dataset: _LerobotTargetDataset
+        train_sample_count: int
+        extra_metrics: dict[str, float] = {}
+        if annotations_json:
+            ann_eps = _parse_keyphase_annotations(annotations_json)
+            clip_min = float(getattr(self._train_config.model, "value_bin_min", -1.0))
             outcome_path = pathlib.Path(ds.root) / "meta" / "online_episode_outcomes.jsonl"
             if not outcome_path.exists():
                 raise RuntimeError(
-                    f"EvoRL-style target needs episode outcomes file: {outcome_path}. "
+                    f"Phase-conditioned value target needs episode outcomes file: {outcome_path}. "
                     "Please enable env-side outcome logging."
                 )
             outcome_by_ep: dict[int, bool] = {}
@@ -644,84 +840,182 @@ class ValueMCService:
                         continue
                     rec = json.loads(line)
                     outcome_by_ep[int(rec["episode_index"])] = self._resolve_success_bool(rec.get("success", False))
-
-            c_fail_coef = float(self._value_c_fail_coef)
-            if c_fail_coef < 0:
-                raise ValueError("'value_c_fail_coef' must be non-negative.")
-            clip_min = float(getattr(self._train_config.model, "value_bin_min", -1.0))
-            clip_max = float(getattr(self._train_config.model, "value_bin_max", 0.0))
-            global_scale = self._compute_global_length_scale(ep_to_indices)
-
-            log.info(
-                "train_mc_from_lerobot EvoRL-target mode: episodes=%d global_scale=%.3f c_fail_coef=%.4f clip=[%.3f, %.3f] "
-                "(treating whole dataset as one task; value_length_scale_quantile=%.3f ignored)",
-                len(ep_to_indices),
-                global_scale,
-                c_fail_coef,
-                clip_min,
-                clip_max,
-                self._value_length_scale_quantile,
-            )
-            for ep in sorted(ep_to_indices.keys()):
-                rows_ep = sorted(ep_to_indices[ep], key=lambda idx: int(fi_arr[idx]))
-                success = bool(outcome_by_ep.get(ep, False))
-                c_fail = float(global_scale)
-                ep_len = len(rows_ep)
-                for pos, ds_idx in enumerate(rows_ep):
-                    remaining_steps = float(ep_len - int(pos) - 1)
-                    g = -float(remaining_steps)
-                    if not success:
-                        g -= (c_fail_coef**remaining_steps) * c_fail
-                    denom = float(global_scale) + c_fail
-                    target = float(np.clip(g / denom, clip_min, clip_max))
-                    target_arr[int(ds_idx)] = target
-        elif has_mc_return:
-            log.info("train_mc_from_lerobot using mc_return field.")
-            if mc_return_arr is None:
-                raise RuntimeError("Detected mc_return fields but failed to build mc_return array.")
-            target_arr = mc_return_arr.astype(np.float32, copy=False)
-        else:
-            log.info("train_mc_from_lerobot mc_return missing, building returns from outcome jsonl.")
-            outcome_path = pathlib.Path(ds.root) / "meta" / "online_episode_outcomes.jsonl"
-            if not outcome_path.exists():
-                raise RuntimeError(
-                    f"`mc_return` not found in dataset and outcomes file missing: {outcome_path}. "
-                    "Please enable env-side outcome logging or provide mc_return labels."
-                )
-            outcome_by_ep: dict[int, bool] = {}
-            with outcome_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+            phase_samples: list[PhaseTrainSample] = []
+            phase_name_set: set[str] = set()
+            for ep in sorted(ann_eps.keys()):
+                spans = ann_eps[ep]
+                if not spans:
+                    continue
+                episode_success = bool(outcome_by_ep.get(ep, False))
+                rows_ep = sorted(ep_to_indices.get(ep, []), key=lambda idx: int(fi_arr[idx]))
+                if not rows_ep:
+                    log.warning("train_mc_from_lerobot phase annotation skipped: episode=%d not found in dataset", ep)
+                    continue
+                row_by_frame = {int(fi_arr[idx]): int(idx) for idx in rows_ep}
+                for span_idx, span in enumerate(spans):
+                    phase_rows: list[int] = []
+                    for frame_idx in range(int(span.start), int(span.end) + 1):
+                        ds_idx = row_by_frame.get(frame_idx)
+                        if ds_idx is not None:
+                            phase_rows.append(ds_idx)
+                    if not phase_rows:
+                        log.warning(
+                            "train_mc_from_lerobot phase annotation empty after frame lookup: episode=%d phase=%s range=[%d,%d]",
+                            ep,
+                            span.name,
+                            span.start,
+                            span.end,
+                        )
                         continue
-                    rec = json.loads(line)
-                    outcome_by_ep[int(rec["episode_index"])] = bool(rec["success"])
+                    phase_name_set.add(span.name)
+                    phase_success = bool(episode_success or span_idx < len(spans) - 1)
+                    for ds_idx in phase_rows:
+                        row = ds[int(ds_idx)]
+                        row_dict = {k: row[k] for k in row.keys()}
+                        base_prompt = _resolve_row_task_prompt(
+                            row_idx=int(ds_idx),
+                            row=row_dict,
+                            tasks=tasks,
+                            task_index_arr=task_index_arr,
+                            task_name_by_idx=task_name_by_idx,
+                        )
+                        phase_prompt = _compose_phase_prompt(base_prompt, span.name)
+                        if self._value_target_mode == "evorl_normalized":
+                            target = 0.0 if phase_success else clip_min
+                        else:
+                            target = 0.0 if phase_success else -100.0
+                        phase_samples.append(
+                            PhaseTrainSample(
+                                ds_index=int(ds_idx),
+                                phase_name=span.name,
+                                phase_prompt=phase_prompt,
+                                target=float(target),
+                            )
+                        )
+            if not phase_samples:
+                raise RuntimeError(
+                    f"No phase-aligned value training samples were created from annotations: {annotations_json}"
+                )
+            input_transform = _build_input_transform(
+                self._train_config,
+                tasks=tasks,
+                checkpoint_dir=self._checkpoint_dir,
+                prompt_from_task=False,
+            )
+            dataset = _LerobotTargetDataset(
+                ds,
+                input_transform,
+                np.asarray([sample.target for sample in phase_samples], dtype=np.float32),
+                ds_indices=np.asarray([sample.ds_index for sample in phase_samples], dtype=np.int32),
+                prompt_overrides=[sample.phase_prompt for sample in phase_samples],
+            )
+            train_sample_count = len(phase_samples)
+            extra_metrics["num_phase_spans"] = float(
+                sum(len(spans) for spans in ann_eps.values())
+            )
+            extra_metrics["num_phase_names"] = float(len(phase_name_set))
+            log.info(
+                "train_mc_from_lerobot phase-conditioned mode: samples=%d phase_names=%d annotations=%s target_mode=%s",
+                train_sample_count,
+                len(phase_name_set),
+                annotations_json,
+                self._value_target_mode,
+            )
+        else:
+            target_arr = np.zeros((num_rows,), dtype=np.float32)
+            if self._value_target_mode == "evorl_normalized":
+                outcome_path = pathlib.Path(ds.root) / "meta" / "online_episode_outcomes.jsonl"
+                if not outcome_path.exists():
+                    raise RuntimeError(
+                        f"EvoRL-style target needs episode outcomes file: {outcome_path}. "
+                        "Please enable env-side outcome logging."
+                    )
+                outcome_by_ep: dict[int, bool] = {}
+                with outcome_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        outcome_by_ep[int(rec["episode_index"])] = self._resolve_success_bool(rec.get("success", False))
 
-            gamma = float(self._mc_gamma)
-            for ep in sorted(ep_to_indices.keys()):
-                rows_ep = sorted(ep_to_indices[ep], key=lambda idx: int(fi_arr[idx]))
-                success = outcome_by_ep.get(ep, False)
-                final_reward = 0.0 if success else -100.0
-                returns = [0.0] * len(rows_ep)
-                if rows_ep:
-                    returns[-1] = final_reward
-                    for idx in range(len(rows_ep) - 2, -1, -1):
-                        returns[idx] = -1.0 + gamma * returns[idx + 1]
-                for ds_idx, ret in zip(rows_ep, returns):
-                    target_arr[int(ds_idx)] = float(ret)
+                c_fail_coef = float(self._value_c_fail_coef)
+                if c_fail_coef < 0:
+                    raise ValueError("'value_c_fail_coef' must be non-negative.")
+                clip_min = float(getattr(self._train_config.model, "value_bin_min", -1.0))
+                clip_max = float(getattr(self._train_config.model, "value_bin_max", 0.0))
+                global_scale = self._compute_global_length_scale(ep_to_indices)
 
-        tasks = getattr(getattr(ds, "meta", None), "tasks", None)
-        input_transform = _build_input_transform(
-            self._train_config,
-            tasks=tasks,
-            checkpoint_dir=self._checkpoint_dir,
-        )
-        dataset = _LerobotTargetDataset(ds, input_transform, target_arr)
+                log.info(
+                    "train_mc_from_lerobot EvoRL-target mode: episodes=%d global_scale=%.3f c_fail_coef=%.4f clip=[%.3f, %.3f] "
+                    "(treating whole dataset as one task; value_length_scale_quantile=%.3f ignored)",
+                    len(ep_to_indices),
+                    global_scale,
+                    c_fail_coef,
+                    clip_min,
+                    clip_max,
+                    self._value_length_scale_quantile,
+                )
+                for ep in sorted(ep_to_indices.keys()):
+                    rows_ep = sorted(ep_to_indices[ep], key=lambda idx: int(fi_arr[idx]))
+                    success = bool(outcome_by_ep.get(ep, False))
+                    c_fail = float(global_scale)
+                    ep_len = len(rows_ep)
+                    for pos, ds_idx in enumerate(rows_ep):
+                        remaining_steps = float(ep_len - int(pos) - 1)
+                        g = -float(remaining_steps)
+                        if not success:
+                            g -= (c_fail_coef**remaining_steps) * c_fail
+                        denom = float(global_scale) + c_fail
+                        target = float(np.clip(g / denom, clip_min, clip_max))
+                        target_arr[int(ds_idx)] = target
+            elif has_mc_return:
+                log.info("train_mc_from_lerobot using mc_return field.")
+                if mc_return_arr is None:
+                    raise RuntimeError("Detected mc_return fields but failed to build mc_return array.")
+                target_arr = mc_return_arr.astype(np.float32, copy=False)
+            else:
+                log.info("train_mc_from_lerobot mc_return missing, building returns from outcome jsonl.")
+                outcome_path = pathlib.Path(ds.root) / "meta" / "online_episode_outcomes.jsonl"
+                if not outcome_path.exists():
+                    raise RuntimeError(
+                        f"`mc_return` not found in dataset and outcomes file missing: {outcome_path}. "
+                        "Please enable env-side outcome logging or provide mc_return labels."
+                    )
+                outcome_by_ep: dict[int, bool] = {}
+                with outcome_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        outcome_by_ep[int(rec["episode_index"])] = bool(rec["success"])
+
+                gamma = float(self._mc_gamma)
+                for ep in sorted(ep_to_indices.keys()):
+                    rows_ep = sorted(ep_to_indices[ep], key=lambda idx: int(fi_arr[idx]))
+                    success = outcome_by_ep.get(ep, False)
+                    final_reward = 0.0 if success else -100.0
+                    returns = [0.0] * len(rows_ep)
+                    if rows_ep:
+                        returns[-1] = final_reward
+                        for idx in range(len(rows_ep) - 2, -1, -1):
+                            returns[idx] = -1.0 + gamma * returns[idx + 1]
+                    for ds_idx, ret in zip(rows_ep, returns):
+                        target_arr[int(ds_idx)] = float(ret)
+
+            input_transform = _build_input_transform(
+                self._train_config,
+                tasks=tasks,
+                checkpoint_dir=self._checkpoint_dir,
+            )
+            dataset = _LerobotTargetDataset(ds, input_transform, target_arr)
+            train_sample_count = num_rows
         all_metrics: list[dict[str, float]] = []
-        total_steps = int(np.ceil(float(num_rows) / float(self._mc_batch_size)))
+        total_steps = int(np.ceil(float(train_sample_count) / float(self._mc_batch_size)))
         log.info(
             "train_mc_from_lerobot prepared_samples=%d epochs=%d batch_size=%d steps_per_epoch=%d",
-            num_rows,
+            train_sample_count,
             self._mc_epochs,
             self._mc_batch_size,
             total_steps,
@@ -752,7 +1046,8 @@ class ValueMCService:
         mean = {}
         for k in all_metrics[0]:
             mean[k] = float(np.mean([m[k] for m in all_metrics]))
-        mean["num_samples"] = float(num_rows)
+        mean["num_samples"] = float(train_sample_count)
+        mean.update(extra_metrics)
         saved_to = self._autosave_after_train("train_mc_from_lerobot")
         if saved_to:
             mean["saved_state_file"] = saved_to
@@ -774,8 +1069,9 @@ class ValueMCService:
             repo_id,
             annotations_json,
         )
-        ann = json.loads(pathlib.Path(annotations_json).read_text(encoding="utf-8"))
-        ann_eps = {int(k): sorted(set(int(x) for x in v)) for k, v in ann.get("episodes", {}).items()}
+        ann_eps = _parse_keyphase_annotations(annotations_json)
+        phase_names = _load_keyphase_phase_names(annotations_json)
+        phase_to_class = {name: idx + 1 for idx, name in enumerate(phase_names)}
 
         ensure_local_hf_cache()
         ds = LeRobotDataset(repo_id=repo_id, root=dataset_root)
@@ -783,14 +1079,12 @@ class ValueMCService:
             log.info("train_keyframe_from_lerobot empty dataset.")
             return {
                 "keyframe_loss": 0.0,
+                "keyframe_prob_mae": 0.0,
+                "keyframe_mse": 0.0,
                 "keyframe_acc": 0.0,
-                "keyframe_distance_mae": 0.0,
                 "keyframe_grad_norm": 0.0,
                 "num_samples": 0.0,
             }
-
-        half_chunk = max(1, int(self._keyframe_chunk_size // 2))
-        num_bins = int(getattr(self._train_config.model, "keyframe_num_bins", 0) or max(2, half_chunk))
 
         num_rows = len(ds)
         tasks = getattr(getattr(ds, "meta", None), "tasks", None)
@@ -799,23 +1093,37 @@ class ValueMCService:
             tasks=tasks,
             checkpoint_dir=self._checkpoint_dir,
         )
+        train_indices: list[int] = []
+        for ds_idx in range(num_rows):
+            item = ds[int(ds_idx)]
+            ep = int(np.asarray(item["episode_index"]).item())
+            spans = ann_eps.get(ep)
+            if not spans:
+                continue
+            fi = int(np.asarray(item["frame_index"]).item())
+            last_end = int(spans[-1].end)
+            if fi <= last_end:
+                train_indices.append(int(ds_idx))
+        if not train_indices:
+            raise RuntimeError("No keyframe training rows remain after filtering frames after last keyphase.")
         dataset = _LerobotKeyframeDataset(
             ds,
             input_transform,
             ann_eps=ann_eps,
-            num_bins=num_bins,
+            phase_to_class=phase_to_class,
+            ds_indices=np.asarray(train_indices, dtype=np.int32),
         )
         all_metrics: list[dict[str, float]] = []
-        total_steps = int(np.ceil(float(num_rows) / float(self._keyframe_batch_size)))
+        train_sample_count = len(train_indices)
+        total_steps = int(np.ceil(float(train_sample_count) / float(self._keyframe_batch_size)))
         log.info(
             (
                 "train_keyframe_from_lerobot prepared_samples=%d "
-                "chunk_size=%d bins=%d "
+                "bins=%d "
                 "epochs=%d batch_size=%d steps_per_epoch=%d"
             ),
-            num_rows,
-            self._keyframe_chunk_size,
-            num_bins,
+            train_sample_count,
+            int(getattr(self._train_config.model, "keyframe_num_bins", KEYFRAME_NUM_BINS)),
             self._keyframe_epochs,
             self._keyframe_batch_size,
             total_steps,
@@ -836,7 +1144,7 @@ class ValueMCService:
             for step_i in range(1, total_steps + 1):
                 batch = next(data_iter)
                 batch_obs = self._batch_to_model_inputs(batch["obs"])
-                batch_label = jnp.asarray(batch["target"], dtype=jnp.int32)
+                batch_label = jnp.asarray(batch["target"], dtype=jnp.float32)
                 metrics = self._train_one_keyframe_batch(batch_obs, batch_label)
                 all_metrics.append(metrics)
                 if self._should_log_step_timing(step_i, total_steps):
@@ -859,7 +1167,8 @@ class ValueMCService:
         mean = {}
         for k in all_metrics[0]:
             mean[k] = float(np.mean([m[k] for m in all_metrics]))
-        mean["num_samples"] = float(num_rows)
+        mean["num_samples"] = float(train_sample_count)
+        mean["num_phase_classes"] = float(len(phase_to_class) + 1)
         saved_to = self._autosave_after_train("train_keyframe_from_lerobot")
         if saved_to:
             mean["saved_state_file"] = saved_to
@@ -911,6 +1220,9 @@ class ValueMCWebsocketServer:
                     metrics = self._service.train_mc_from_lerobot(
                         dataset_root=str(msg["dataset_root"]),
                         repo_id=str(msg["repo_id"]),
+                        annotations_json=(
+                            str(msg["annotations_json"]) if msg.get("annotations_json") is not None else None
+                        ),
                     )
                     resp = {"metrics": metrics}
                 elif cmd == "train_keyframe_from_lerobot":
@@ -920,6 +1232,22 @@ class ValueMCWebsocketServer:
                         annotations_json=str(msg["annotations_json"]),
                     )
                     resp = {"metrics": metrics}
+                elif cmd == "train_value_and_keyframe_from_lerobot":
+                    annotations_json = str(msg["annotations_json"])
+                    keyframe_metrics = self._service.train_keyframe_from_lerobot(
+                        dataset_root=str(msg["dataset_root"]),
+                        repo_id=str(msg["repo_id"]),
+                        annotations_json=annotations_json,
+                    )
+                    value_metrics = self._service.train_mc_from_lerobot(
+                        dataset_root=str(msg["dataset_root"]),
+                        repo_id=str(msg["repo_id"]),
+                        annotations_json=annotations_json,
+                    )
+                    resp = {
+                        "keyframe_metrics": keyframe_metrics,
+                        "value_metrics": value_metrics,
+                    }
                 else:
                     raise ValueError(f"Unknown command: {cmd}")
                 await websocket.send(packer.pack(resp))

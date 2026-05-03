@@ -76,14 +76,21 @@ class ValueWebsocketClient:
                 out[key] = v
         return out
 
-    def train_mc_from_lerobot(self, *, dataset_root: str, repo_id: str) -> dict[str, Any]:
-        resp = self._request(
-            {
-                "cmd": "train_mc_from_lerobot",
-                "dataset_root": dataset_root,
-                "repo_id": repo_id,
-            }
-        )
+    def train_mc_from_lerobot(
+        self,
+        *,
+        dataset_root: str,
+        repo_id: str,
+        annotations_json: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "cmd": "train_mc_from_lerobot",
+            "dataset_root": dataset_root,
+            "repo_id": repo_id,
+        }
+        if annotations_json:
+            payload["annotations_json"] = annotations_json
+        resp = self._request(payload)
         metrics = resp.get("metrics", {})
         if not isinstance(metrics, dict):
             return {}
@@ -108,6 +115,30 @@ class ValueWebsocketClient:
         if not isinstance(metrics, dict):
             return {}
         return self._coerce_metrics(metrics)
+
+    def train_value_and_keyframe_from_lerobot(
+        self,
+        *,
+        dataset_root: str,
+        repo_id: str,
+        annotations_json: str,
+    ) -> dict[str, Any]:
+        resp = self._request(
+            {
+                "cmd": "train_value_and_keyframe_from_lerobot",
+                "dataset_root": dataset_root,
+                "repo_id": repo_id,
+                "annotations_json": annotations_json,
+            }
+        )
+        out: dict[str, Any] = {}
+        for key in ("keyframe_metrics", "value_metrics"):
+            metrics = resp.get(key, {})
+            if isinstance(metrics, dict):
+                out[key] = self._coerce_metrics(metrics)
+            else:
+                out[key] = {}
+        return out
 
     def close(self) -> None:
         try:

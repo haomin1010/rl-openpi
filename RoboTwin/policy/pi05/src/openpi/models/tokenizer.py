@@ -1,9 +1,11 @@
 import logging
 import os
+from typing import Literal
 
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
+from scipy.fft import dct
 from scipy.fft import idct
 import sentencepiece
 from transformers import AutoProcessor
@@ -50,8 +52,20 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(
+        self,
+        max_len: int = 256,
+        fast_tokenizer_path: str = "physical-intelligence/fast",
+        transpose_dct_before_bpe: bool = False,
+        rowwise_bpe: bool = False,
+        rowwise_layout: Literal["action_dim_major", "time_major"] = "action_dim_major",
+    ):
         self._max_len = max_len
+        self._transpose_dct_before_bpe = transpose_dct_before_bpe
+        self._rowwise_bpe = bool(rowwise_bpe)
+        self._rowwise_layout = str(rowwise_layout)
+        if self._rowwise_layout not in {"action_dim_major", "time_major"}:
+            raise ValueError(f"Unsupported rowwise_layout: {rowwise_layout}")
 
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -67,6 +81,14 @@ class FASTTokenizer:
             raise ValueError("Failed to tokenize '|' separator for FAST action parsing.")
         self._action_sep_token = int(bar_tokens[0])
 
+    @property
+    def rowwise_bpe(self) -> bool:
+        return bool(self._rowwise_bpe)
+
+    @property
+    def rowwise_layout(self) -> str:
+        return str(self._rowwise_layout)
+
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -81,9 +103,7 @@ class FASTTokenizer:
         prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
 
         if actions is not None:
-            # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
-            action_tokens = self._fast_tokenizer(actions[None])[0]
-            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
+            action_tokens_in_pg = self._encode_actions_to_pg_tokens(actions)
 
             # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
             postfix_tokens = (
@@ -209,12 +229,22 @@ class FASTTokenizer:
                 f"Decoded DCT coefficients have length {decoded_dct_coeff.shape[0]}, expected {expected_seq_len}."
             )
 
-        decoded_dct_coeff = decoded_dct_coeff.reshape(-1, action_dim)
+        decoded_dct_coeff = self._deserialize_dct_coeffs(
+            decoded_dct_coeff,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+        )
         if decoded_dct_coeff.shape != (action_horizon, action_dim):
             raise ValueError(
                 f"Decoded DCT coefficients have shape {decoded_dct_coeff.shape}, expected ({action_horizon}, {action_dim})."
-            )
+        )
         return decoded_dct_coeff.astype(np.float32, copy=False)
+
+    def action_prefix_tokens(self) -> np.ndarray:
+        return np.asarray(self._action_prefix_tokens, dtype=np.int32).copy()
+
+    def action_suffix_tokens(self, *, add_eos: bool = True) -> np.ndarray:
+        return np.asarray(self._paligemma_tokenizer.encode("|", add_eos=add_eos), dtype=np.int32)
 
     def decode_action_dct_coeffs(self, dct_coeffs: np.ndarray) -> np.ndarray:
         coeffs = np.asarray(dct_coeffs, dtype=np.float32)
@@ -222,19 +252,32 @@ class FASTTokenizer:
             raise ValueError(f"Expected DCT coefficients with shape [T, D], got {coeffs.shape}.")
         return idct(coeffs / self._fast_tokenizer.scale, axis=0, norm="ortho").astype(np.float32)
 
+    def _encode_actions_to_pg_tokens(self, actions: np.ndarray) -> np.ndarray:
+        act = np.asarray(actions, dtype=np.float32)
+        if act.ndim != 2:
+            raise ValueError(f"Expected actions with shape [T, D], got {act.shape}.")
+        if not self._rowwise_bpe:
+            action_tokens = self._fast_tokenizer(act[None])[0]
+            return self._act_tokens_to_paligemma_tokens(action_tokens)
+        dct_coeffs = dct(act, axis=0, norm="ortho").astype(np.float32) * float(self._fast_tokenizer.scale)
+        return self.encode_action_dct_coeffs(dct_coeffs)
+
     def encode_action_dct_coeffs(self, dct_coeffs: np.ndarray) -> np.ndarray:
         coeffs = np.asarray(dct_coeffs, dtype=np.float32)
         if coeffs.ndim != 2:
             raise ValueError(f"Expected DCT coefficients with shape [T, D], got {coeffs.shape}.")
-        quantized = np.rint(coeffs).astype(np.int32).reshape(-1)
-        shifted = quantized - int(self._fast_tokenizer.min_token)
-        shifted = np.clip(shifted, 0, 0x10FFFF)
-        bpe_text = "".join(chr(int(v)) for v in shifted.tolist())
-        try:
-            encoded = self._fast_tokenizer.bpe_tokenizer.encode(bpe_text)
-        except Exception as exc:
-            raise ValueError(f"Failed to encode DCT coefficients with FAST tokenizer: {exc}") from exc
-        encoded_arr = np.asarray(encoded if isinstance(encoded, list) else list(encoded), dtype=np.int32)
+        quantized = np.rint(coeffs).astype(np.int32)
+        if self._rowwise_bpe:
+            encoded_rows: list[np.ndarray] = []
+            for row in self._serialize_dct_coeff_rows(quantized):
+                encoded_rows.append(self._encode_bpe_chars(row))
+            encoded_arr = (
+                np.concatenate(encoded_rows, axis=0).astype(np.int32, copy=False)
+                if encoded_rows
+                else np.asarray([], dtype=np.int32)
+            )
+        else:
+            encoded_arr = self._encode_bpe_chars(self._serialize_dct_coeffs(quantized))
         return self._act_tokens_to_paligemma_tokens(encoded_arr)
 
     def decode_action_tokens_to_actions(
@@ -271,6 +314,83 @@ class FASTTokenizer:
         if isinstance(tokens, list):
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+    def _serialize_dct_coeffs(self, coeffs: np.ndarray) -> np.ndarray:
+        coeffs = np.asarray(coeffs)
+        if coeffs.ndim != 2:
+            raise ValueError(f"Expected DCT coefficients with shape [T, D], got {coeffs.shape}.")
+        ordered = coeffs.T if self._transpose_dct_before_bpe else coeffs
+        return ordered.reshape(-1)
+
+    def _serialize_dct_coeff_rows(self, coeffs: np.ndarray) -> list[np.ndarray]:
+        coeffs = np.asarray(coeffs)
+        if coeffs.ndim != 2:
+            raise ValueError(f"Expected DCT coefficients with shape [T, D], got {coeffs.shape}.")
+        if self._rowwise_layout == "action_dim_major":
+            ordered = coeffs.T
+        else:
+            ordered = coeffs
+        return [np.asarray(row).reshape(-1) for row in ordered]
+
+    def row_structure(self, *, action_horizon: int, action_dim: int) -> tuple[int, int]:
+        if self._rowwise_layout == "action_dim_major":
+            return int(action_dim), int(action_horizon)
+        return int(action_horizon), int(action_dim)
+
+    def row_char_width(self, *, action_horizon: int, action_dim: int) -> int:
+        _, width = self.row_structure(action_horizon=action_horizon, action_dim=action_dim)
+        return int(width)
+
+    def num_rows(self, *, action_horizon: int, action_dim: int) -> int:
+        rows, _ = self.row_structure(action_horizon=action_horizon, action_dim=action_dim)
+        return int(rows)
+
+    def decode_fast_tokens_to_text(self, fast_tokens: np.ndarray | list[int]) -> str:
+        toks = np.asarray(fast_tokens, dtype=np.int32).reshape(-1)
+        if toks.size == 0:
+            return ""
+        return str(self._fast_tokenizer.bpe_tokenizer.decode(toks.tolist()))
+
+    def decode_pg_tokens_to_text(self, pg_tokens: np.ndarray | list[int]) -> str:
+        pg = np.asarray(pg_tokens, dtype=np.int32).reshape(-1)
+        if pg.size == 0:
+            return ""
+        return self.decode_fast_tokens_to_text(self._pg_tokens_to_fast_tokens(pg))
+
+    def encode_row_chars_to_pg_tokens(self, row_coeffs: np.ndarray) -> np.ndarray:
+        row = np.asarray(row_coeffs, dtype=np.int32).reshape(-1)
+        return self._act_tokens_to_paligemma_tokens(self._encode_bpe_chars(row))
+
+    def decode_row_pg_tokens_to_coeffs(self, pg_tokens: np.ndarray, *, row_width: int) -> np.ndarray:
+        text = self.decode_pg_tokens_to_text(pg_tokens)
+        coeffs = np.asarray([ord(ch) + int(self._fast_tokenizer.min_token) for ch in text], dtype=np.float32)
+        if coeffs.shape[0] < int(row_width):
+            coeffs = np.pad(coeffs, (0, int(row_width) - coeffs.shape[0]), mode="constant", constant_values=0)
+        elif coeffs.shape[0] > int(row_width):
+            coeffs = coeffs[: int(row_width)]
+        return coeffs.astype(np.float32, copy=False)
+
+    def _encode_bpe_chars(self, quantized: np.ndarray) -> np.ndarray:
+        shifted = np.asarray(quantized, dtype=np.int32).reshape(-1) - int(self._fast_tokenizer.min_token)
+        shifted = np.clip(shifted, 0, 0x10FFFF)
+        bpe_text = "".join(chr(int(v)) for v in shifted.tolist())
+        try:
+            encoded = self._fast_tokenizer.bpe_tokenizer.encode(bpe_text)
+        except Exception as exc:
+            raise ValueError(f"Failed to encode DCT coefficients with FAST tokenizer: {exc}") from exc
+        return np.asarray(encoded if isinstance(encoded, list) else list(encoded), dtype=np.int32)
+
+    def _deserialize_dct_coeffs(
+        self,
+        flat_coeffs: np.ndarray,
+        *,
+        action_horizon: int,
+        action_dim: int,
+    ) -> np.ndarray:
+        flat_coeffs = np.asarray(flat_coeffs)
+        if self._transpose_dct_before_bpe:
+            return flat_coeffs.reshape(action_dim, action_horizon).T
+        return flat_coeffs.reshape(action_horizon, action_dim)
 
 
 ###########################################################################

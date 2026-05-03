@@ -18,6 +18,7 @@ class _EnvState:
     transformed_obs: dict[str, Any]
     task: str | None
     value: float
+    phase_class: int | None = None
     step_id: int = 0
 
 
@@ -62,7 +63,15 @@ class Pi0FastChunkCollector:
             obs["prompt"] = task
         transformed = self._policy.transform_observation(obs)
         value = self._predict_value(obs, transformed)
-        self._state = _EnvState(obs=obs, transformed_obs=transformed, task=str(task), value=value, step_id=0)
+        phase_class = int(self._policy.predict_keyframe_class(obs))
+        self._state = _EnvState(
+            obs=obs,
+            transformed_obs=transformed,
+            task=str(task),
+            value=value,
+            phase_class=phase_class,
+            step_id=0,
+        )
 
     def collect_chunk_batch(self, *, policy_version: int) -> list[ChunkSample]:
         if self._state is None:
@@ -85,6 +94,7 @@ class Pi0FastChunkCollector:
         reward = float(provider_result["reward"])
         next_transformed_obs = self._policy.transform_observation(next_obs)
         next_value = self._predict_value(next_obs, next_transformed_obs)
+        next_phase_class = int(self._policy.predict_keyframe_class(next_obs))
 
         sample = ChunkSample(
             obs_t=state.obs,
@@ -102,6 +112,8 @@ class Pi0FastChunkCollector:
             sampled_dct_coeffs=np.asarray(trace["sampled_dct_coeffs"], dtype=np.float32),
             executed_dct_coeffs=np.asarray(trace["dct_coeffs"], dtype=np.float32),
             keyframe_prob=float(trace["keyframe_prob"]),
+            phase_class=state.phase_class,
+            next_phase_class=next_phase_class,
             exploration_applied=bool(trace["exploration_applied"]),
             bootstrap_mask=0.0 if done else 1.0,
             task=str(task),
@@ -121,6 +133,7 @@ class Pi0FastChunkCollector:
                 transformed_obs=transformed,
                 task=task2,
                 value=self._predict_value(obs, transformed),
+                phase_class=int(self._policy.predict_keyframe_class(obs)),
                 step_id=0,
             )
         else:
@@ -129,6 +142,7 @@ class Pi0FastChunkCollector:
                 transformed_obs=next_transformed_obs,
                 task=str(task),
                 value=next_value,
+                phase_class=next_phase_class,
                 step_id=state.step_id + 1,
             )
 

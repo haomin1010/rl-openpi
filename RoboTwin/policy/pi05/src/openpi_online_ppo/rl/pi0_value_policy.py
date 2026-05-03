@@ -81,6 +81,16 @@ class Pi0ValuePolicy:
         probs = self._model.predict_keyframe_prob(observation, stop_gradient=True)
         return np.asarray(probs, dtype=np.float32)
 
+    def predict_keyframe_class(self, obs: dict[str, Any]) -> int:
+        observation, _ = self._prepare_observation(obs)
+        klass = self._model.predict_keyframe_class(observation, stop_gradient=True)[0]
+        return int(np.asarray(klass))
+
+    def predict_keyframe_class_batch(self, obs_batch: list[dict[str, Any]]) -> np.ndarray:
+        observation, _ = self._prepare_observations(obs_batch)
+        klass = self._model.predict_keyframe_class(observation, stop_gradient=True)
+        return np.asarray(klass, dtype=np.int32)
+
     def sync_model(self, model: _pi0_aux.Pi0Aux) -> None:
         self._model = model
 

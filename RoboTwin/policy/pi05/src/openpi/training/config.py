@@ -790,7 +790,15 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_fast_aloha_robotwin_full_ee_delta",
-        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=32),
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=14,
+            action_horizon=32,
+            fast_model_tokenizer_kwargs={
+                "transpose_dct_before_bpe": True,
+                "rowwise_bpe": True,
+                "rowwise_layout": "action_dim_major",
+            },
+        ),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot-hammer-clean-100-ee_delta",
             adapt_to_pi=False,
@@ -812,14 +820,22 @@ _CONFIGS = [
             ),
         ),
         freeze_filter=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=32).get_freeze_filter(),
-        batch_size=128,
+        batch_size=64,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30000,
         fsdp_devices=1,
     ),
     TrainConfig(
         name="pi0_fast_aloha_robotwin_ppo_ee_delta",
-        model=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=32),
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=14,
+            action_horizon=32,
+            fast_model_tokenizer_kwargs={
+                "transpose_dct_before_bpe": True,
+                "rowwise_bpe": True,
+                "rowwise_layout": "action_dim_major",
+            },
+        ),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot-hammer-clean-100-ee_delta",
             adapt_to_pi=False,
