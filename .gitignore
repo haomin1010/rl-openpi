@@ -1,6 +1,7 @@
 models/
 data/*
 .codex/*
+RoboTwin/policy/pi05/checkpoint/*
 !data/process_stuck.py
 __pycache__/
 **/checkpoints/
