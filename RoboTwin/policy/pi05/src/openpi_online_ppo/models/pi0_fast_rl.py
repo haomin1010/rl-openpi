@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 from typing import Any
+import time
 
 import einops
 import flax.nnx as nnx
@@ -408,6 +409,7 @@ class Pi0FAST(_model.BaseModel):
         *,
         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
         temperature: float = 0.0,
+        selected_vocab_indices: at.Int[at.Array, "k"] | None = None,
     ) -> dict[str, at.Array]:
         """Sample autoregressive output tokens and expose per-token decoding trace.
 
@@ -419,6 +421,7 @@ class Pi0FAST(_model.BaseModel):
             observation,
             max_decoding_steps=max_decoding_steps,
             temperature=temperature,
+            selected_vocab_indices=selected_vocab_indices,
         )
 
     def recompute_action_logprobs(
@@ -540,8 +543,11 @@ class Pi0FAST(_model.BaseModel):
         *,
         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
         temperature: float = 0.0,
+        selected_vocab_indices: at.Int[at.Array, "k"] | None = None,
     ) -> dict[str, at.Array]:
+        t0 = time.perf_counter()
         decode_state = self._prepare_decode_prefix(observation, max_decoding_steps)
+        prepare_decode_prefix_s = time.perf_counter() - t0
         last_logit = decode_state["last_logit"]
         kv_cache = decode_state["kv_cache"]
         prefill_size = decode_state["prefill_size"]
@@ -551,12 +557,28 @@ class Pi0FAST(_model.BaseModel):
         output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps), dtype=jnp.int32)
         output_token_logprobs = jnp.zeros((last_logit.shape[0], max_decoding_steps), dtype=last_logit.dtype)
         output_token_mask = jnp.zeros((last_logit.shape[0], max_decoding_steps), dtype=jnp.bool_)
+        if selected_vocab_indices is not None:
+            selected_vocab_indices = jnp.asarray(selected_vocab_indices, dtype=jnp.int32).reshape(-1)
+            output_selected_logprobs = jnp.zeros(
+                (last_logit.shape[0], max_decoding_steps, selected_vocab_indices.shape[0]),
+                dtype=last_logit.dtype,
+            )
+        else:
+            output_selected_logprobs = jnp.zeros((last_logit.shape[0], 0, 0), dtype=last_logit.dtype)
 
         def step(carry):
-            rng, last_logit, output_tokens, output_token_logprobs, output_token_mask, cache, finished, step = carry
+            (
+                rng,
+                last_logit,
+                output_tokens,
+                output_token_logprobs,
+                output_token_mask,
+                output_selected_logprobs,
+                cache,
+                finished,
+                step,
+            ) = carry
 
-            # Sample token from last logit
-            # Split RNG for this step
             rng, rng_step = jax.random.split(rng)
             logp_all = jax.nn.log_softmax(last_logit[:, 0, :], axis=-1)
             token = jax.lax.cond(
@@ -584,12 +606,11 @@ class Pi0FAST(_model.BaseModel):
                 jnp.broadcast_to(step, (token.shape[0], 1)),
                 valid_token[:, None],
             )
+            if selected_vocab_indices is not None:
+                selected_logp = jnp.take(logp_all, selected_vocab_indices, axis=-1)
+                output_selected_logprobs = output_selected_logprobs.at[:, step, :].set(selected_logp)
 
-            # Check for early stopping --> stop if all batch elements have EOS token
             finished = jnp.logical_or(finished, token == PALIGEMMA_EOS_TOKEN)
-            all_eos = jnp.all(finished)
-
-            # Decode one step
             token_embedding = self.PaliGemma.llm(token[:, None], embed_only=True)
             positions = prefill_len[:, None] + step + 1
             mask = jnp.logical_and(
@@ -601,14 +622,35 @@ class Pi0FAST(_model.BaseModel):
                 embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
             )
 
-            return rng, last_logit, output_tokens, output_token_logprobs, output_token_mask, kv_cache, finished, step + 1
+            return (
+                rng,
+                last_logit,
+                output_tokens,
+                output_token_logprobs,
+                output_token_mask,
+                output_selected_logprobs,
+                kv_cache,
+                finished,
+                step + 1,
+            )
 
         def cond(carry):
-            _, _, _, _, _, _, finished, step = carry
+            _, _, _, _, _, _, _, finished, step = carry
             return jnp.logical_and(jnp.logical_not(jnp.all(finished)), step < max_decoding_steps)
 
         # Use lax.while_loop so we can jit the full decoding loop.
-        _, _, output_tokens, output_token_logprobs, output_token_mask, _, _, _ = jax.lax.while_loop(
+        loop_t0 = time.perf_counter()
+        (
+            _,
+            _,
+            output_tokens,
+            output_token_logprobs,
+            output_token_mask,
+            output_selected_logprobs,
+            _,
+            _,
+            _,
+        ) = jax.lax.while_loop(
             cond,
             step,
             (
@@ -617,13 +659,22 @@ class Pi0FAST(_model.BaseModel):
                 output_tokens,
                 output_token_logprobs,
                 output_token_mask,
+                output_selected_logprobs,
                 kv_cache,
                 jnp.zeros((last_logit.shape[0],), dtype=jnp.bool_),
                 0,
             ),
         )
-        return {
+        decode_loop_s = time.perf_counter() - loop_t0
+        out = {
             "tokens": output_tokens,
             "token_logprobs": output_token_logprobs,
             "token_mask": output_token_mask,
+            "timings": {
+                "prepare_decode_prefix_s": prepare_decode_prefix_s,
+                "decode_loop_s": decode_loop_s,
+            },
         }
+        if selected_vocab_indices is not None:
+            out["selected_token_logprobs"] = output_selected_logprobs
+        return out

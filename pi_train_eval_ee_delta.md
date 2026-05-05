@@ -13,6 +13,12 @@
 - `pi0_fast_aloha_robotwin_full_ee_delta`
 - `pi0_fast_aloha_robotwin_ppo_ee_delta`
 
+当前约定：
+
+- SFT checkpoint 与 PPO 使用同一套标准 FAST tokenizer 路径
+- PPO exploration 不再依赖 rowwise / transpose 的特殊 decode 链路
+- 在线 PPO / sigma exploration 的命令以 [ONLINE_PPO_WORKFLOW.md](/mnt/data/lhm/vla-rl/RoboTwin/policy/pi05/ONLINE_PPO_WORKFLOW.md) 为准
+
 EE-Delta 14D 定义见：
 
 - `RoboTwin/policy/pi05/EE_DELTA_14D_DESIGN.md`
@@ -191,3 +197,57 @@ bash eval_ws.sh beat_block_hammer demo_clean pi0_fast_aloha_robotwin_full_ee_del
 - 如果你改了 `repo_id`，要同步修改 `config.py` 中 EE 训练配置的 `repo_id`。
 - `process_data.py --representation ee_delta` 是离线 EE 数据的关键开关。
 - 在线 PPO / 在线 rollout / exploration net 统一以 [ONLINE_PPO_WORKFLOW.md](/mnt/data/lhm/vla-rl/RoboTwin/policy/pi05/ONLINE_PPO_WORKFLOW.md) 为准。
+
+## 11. 当前在线 PPO / Sigma Net 常用命令
+
+如果你已经完成了 SFT checkpoint、在线 corpus 合并、keyphase 标注和值头训练，当前推荐的 sigma net 训练命令是：
+
+```bash
+cd /mnt/data/lhm/vla-rl/RoboTwin/policy/pi05
+uv run python scripts/fit_dimwise_sigma_net_lerobot.py \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
+  --out checkpoints/explored_net/dimwise_sigma_dct.pkl \
+  --chunk_size 32 \
+  --action_noise_dims "0,1,2,3,4,5,6" \
+  --action_delta_limit 0.1 \
+  --noise_dct_keep_k 4 \
+  --epochs 100 \
+  --batch_size 128
+```
+
+语义：
+
+- 输入是 `C[:4, selected_action_dims]` 的 flatten 结果
+- 输出是对应位置的 `sigma`
+- 不是方差
+
+当前推荐的 sigma-net PPO 命令是：
+
+```bash
+cd /mnt/data/lhm/vla-rl/RoboTwin/policy/pi05
+uv run python scripts/train_pi0_fast_online_v2.py \
+  --policy.path checkpoints/pi0_fast_aloha_robotwin_full_ee_delta/beat_block_hammer_pi0fast_full_ee_delta/30000/ \
+  --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
+  --env.ws_url ws://127.0.0.1:8765 \
+  --total_updates 10 \
+  --rollout_batch_size 64 \
+  --mini_batch_size 32 \
+  --ppo_epochs 1 \
+  --value.ws_url ws://127.0.0.1:8877 \
+  --explore_mode conditional_keyframe \
+  --explore_keyframe_threshold 0.5 \
+  --explore_perturb_backend dct_sigma_network \
+  --explore_network_ckpt checkpoints/explored_net/dimwise_sigma_dct.pkl \
+  --explore_action_noise_dims "0,1,2,3,4,5,6"
+```
+
+这条链路现在是：
+
+- 先标准 full-chunk decode
+- 再做 DCT 子块 sigma 扰动
+- 最后对执行 token 重新算 logprob
+- phase / value 都统一走 ws value server
+- keyframe exploration gate 也统一走 ws value server
+- 整个 chunk 的执行后 value 预测固定使用 chunk 起点 phase

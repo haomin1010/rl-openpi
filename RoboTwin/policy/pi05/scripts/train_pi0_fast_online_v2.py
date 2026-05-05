@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
+import pathlib
 from typing import Any
 
 import numpy as np
@@ -16,7 +18,6 @@ from openpi_online_ppo.models import pi0_fast_rl as _rl_pi0_fast
 from openpi_online_ppo.rl.exploration import CallableDCTNoiseFn
 from openpi_online_ppo.rl.exploration import load_action_perturb_net
 from openpi_online_ppo.rl.exploration import KeyframeExplorationConfig
-from openpi_online_ppo.rl.exploration import LinearKeyframeNet
 from openpi_online_ppo.rl.exploration import default_dct_noise
 from openpi_online_ppo.rl.pi0_fast_online_trainer import Pi0FastOnlineRLConfig
 from openpi_online_ppo.rl.pi0_fast_online_trainer import Pi0FastOnlineTrainer
@@ -27,6 +28,7 @@ from openpi_online_ppo.rl.reward_value import FixedRewardProvider
 from openpi_online_ppo.rl.value_ws_client import ValueWebsocketClient
 
 KEYFRAME_NUM_BINS = 16
+TIMING_LOGGER_NAME = "openpi_online_ppo.timing"
 
 
 def _parse_dim_list(raw: str | None) -> tuple[int, ...] | None:
@@ -81,10 +83,8 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--rollout_batch_size", type=int, default=64)
     p.add_argument("--mini_batch_size", type=int, default=32)
-    p.add_argument("--ppo_epochs", type=int, default=4)
-    p.add_argument("--value_epochs", type=int, default=1)
+    p.add_argument("--ppo_epochs", type=int, default=1)
     p.add_argument("--buffer_capacity", type=int, default=1024)
-    p.add_argument("--max_policy_lag", type=int, default=4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--clip_eps", type=float, default=0.2)
     p.add_argument("--entropy_coef", type=float, default=0.0)
@@ -103,8 +103,6 @@ def _parse_args() -> argparse.Namespace:
         choices=("always", "conditional_keyframe", "never"),
     )
     p.add_argument("--explore_keyframe_threshold", type=float, default=0.5)
-    p.add_argument("--explore_keyframe_gate", type=str, default="model_head", choices=("model_head", "small_net", "none"))
-    p.add_argument("--explore_keyframe_net_ckpt", type=str, default=None)
     p.add_argument("--explore_dct_dims", type=int, default=4)
     p.add_argument("--explore_noise_std", type=float, default=0.01)
     p.add_argument(
@@ -129,7 +127,26 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--explored_chunk_weight", type=float, default=1.0)
     p.add_argument("--non_explored_chunk_weight", type=float, default=1.0)
     p.add_argument("--value.ws_url", dest="value_ws_url", type=str, default=None)
+    p.add_argument("--timing_log_file", type=str, default=None)
     return p.parse_args()
+
+
+def _configure_timing_logger(path: str | None) -> logging.Logger:
+    logger = logging.getLogger(TIMING_LOGGER_NAME)
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    if not path:
+        logger.disabled = True
+        return logger
+    out = pathlib.Path(path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(out, mode="w", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.disabled = False
+    logger.info(json.dumps({"event": "timing_log_started", "path": str(out)}, ensure_ascii=True, sort_keys=True))
+    return logger
 
 
 def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConfig:
@@ -152,11 +169,7 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
     return dataclasses.replace(cfg, model=rl_model)
 
 
-def _to_rollout_only_config(
-    cfg: train_config.TrainConfig,
-    *,
-    enable_model_head_keyframe: bool,
-) -> train_config.TrainConfig:
+def _to_rollout_only_config(cfg: train_config.TrainConfig) -> train_config.TrainConfig:
     if not isinstance(cfg.model, _base_pi0_fast.Pi0FASTConfig):
         raise TypeError(f"Config `{cfg.name}` is not a Pi0FAST config.")
 
@@ -170,7 +183,7 @@ def _to_rollout_only_config(
         fast_model_tokenizer=base.fast_model_tokenizer,
         fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
         use_value_head=False,
-        use_keyframe_head=bool(enable_model_head_keyframe),
+        use_keyframe_head=False,
         keyframe_num_bins=KEYFRAME_NUM_BINS,
     )
     return dataclasses.replace(cfg, model=rollout_model)
@@ -187,13 +200,11 @@ def _run_collection_only(
     for update_idx in range(max(1, int(total_updates))):
         rollout_samples = []
         while len(rollout_samples) < int(rollout_batch_size):
-            rollout_samples.extend(collector.collect_chunk_batch(policy_version=0))
+            rollout_samples.extend(collector.collect_chunk_batch())
         global_chunks += len(rollout_samples)
-        rollout_reward = float(np.mean([sample.reward for sample in rollout_samples])) if rollout_samples else 0.0
         logging.info(
             "collection_only_metrics=%s",
             {
-                "rollout_reward": rollout_reward,
                 "global_chunks": float(global_chunks),
                 "global_updates": float(update_idx + 1),
                 "rollout_batch_size": float(len(rollout_samples)),
@@ -204,17 +215,33 @@ def _run_collection_only(
 def main() -> None:
     args = _parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    timing_logger = _configure_timing_logger(args.timing_log_file)
+    if not timing_logger.disabled:
+        timing_logger.info(
+            json.dumps(
+                {
+                    "event": "train_pi0_fast_online_v2_args",
+                    "policy_path": str(args.policy_path),
+                    "policy_config": str(args.policy_config),
+                    "env_ws_url": str(args.env_ws_url),
+                    "value_ws_url": str(args.value_ws_url) if args.value_ws_url else None,
+                    "buffer_capacity": int(args.buffer_capacity),
+                    "mini_batch_size": int(args.mini_batch_size),
+                    "ppo_epochs": int(args.ppo_epochs),
+                    "total_updates": int(args.total_updates),
+                    "explore_mode": str(args.explore_mode),
+                    "explore_perturb_backend": str(args.explore_perturb_backend),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        )
 
-    collect_only = int(args.ppo_epochs) <= 0 and int(args.value_epochs) <= 0
+    collect_only = int(args.ppo_epochs) <= 0
     policy_config_name = _resolve_policy_config_name(args.policy_config, args.policy_path)
     cfg = train_config.get_config(policy_config_name)
     if collect_only:
-        cfg = _to_rollout_only_config(
-            cfg,
-            enable_model_head_keyframe=(
-                str(args.explore_mode) != "never" and str(args.explore_keyframe_gate) == "model_head"
-            ),
-        )
+        cfg = _to_rollout_only_config(cfg)
     else:
         cfg = _to_rl_train_config(cfg)
 
@@ -240,19 +267,9 @@ def main() -> None:
         perturb_net = load_action_perturb_net(exploration_cfg.network_checkpoint)
 
     value_client = None if collect_only else (ValueWebsocketClient(args.value_ws_url) if args.value_ws_url else None)
-    keyframe_net = None
-    keyframe_mode = "none"
-    if str(args.explore_keyframe_gate) == "small_net":
-        if args.explore_keyframe_net_ckpt:
-            keyframe_net = LinearKeyframeNet.load(args.explore_keyframe_net_ckpt)
-            keyframe_mode = "local_small_net"
-        elif value_client is not None:
-            keyframe_mode = "remote_value_ws"
-        else:
-            raise ValueError(
-                "small_net gate requires either --explore_keyframe_net_ckpt "
-                "or --value.ws_url (for remote keyframe inference)."
-            )
+    if str(args.explore_mode) != "never" and value_client is None:
+        raise ValueError("Exploration requires --value.ws_url for websocket keyframe/value inference.")
+
     def _noise_impl(**kwargs):
         md = dict(kwargs.get("metadata") or {})
         if perturb_net is not None:
@@ -268,20 +285,15 @@ def main() -> None:
 
     keyframe_prob_fn = None
     policy_holder: dict[str, Any] = {}
-    if str(args.explore_keyframe_gate) == "small_net":
-        if keyframe_mode == "local_small_net":
-            keyframe_prob_fn = lambda obs: float(keyframe_net.predict_prob(obs))  # noqa: E731
-        elif keyframe_mode == "remote_value_ws":
-            def _keyframe_prob_fn_remote(obs):
-                policy_obj = policy_holder.get("policy")
-                if policy_obj is None:
-                    raise RuntimeError("policy is not initialized for remote keyframe inference")
-                transformed = policy_obj.transform_observation(obs)
-                return float(value_client.predict_keyframe(transformed))
+    if str(args.explore_mode) != "never":
+        def _keyframe_prob_fn_remote(obs):
+            policy_obj = policy_holder.get("policy")
+            if policy_obj is None:
+                raise RuntimeError("policy is not initialized for remote keyframe inference")
+            transformed = policy_obj.transform_observation(obs)
+            return float(value_client.predict_keyframe(transformed))
 
-            keyframe_prob_fn = _keyframe_prob_fn_remote
-    elif str(args.explore_keyframe_gate) == "none":
-        keyframe_prob_fn = lambda obs: 0.0  # noqa: E731
+        keyframe_prob_fn = _keyframe_prob_fn_remote
 
     policy = create_trained_pi0_fast_rl_policy(
         cfg,
@@ -324,7 +336,7 @@ def main() -> None:
     try:
         if collect_only:
             logging.info(
-                "collection_only_mode enabled: skipping trainer/value updates and rollout logprob recomputation"
+                "collection_only_mode enabled: skipping actor updates and rollout logprob recomputation"
             )
             _run_collection_only(
                 collector=collector,
@@ -336,12 +348,10 @@ def main() -> None:
                 rollout_batch_size=args.rollout_batch_size,
                 mini_batch_size=args.mini_batch_size,
                 ppo_epochs=args.ppo_epochs,
-                value_epochs=args.value_epochs,
                 gamma=args.gamma,
                 clip_eps=args.clip_eps,
                 entropy_coef=args.entropy_coef,
                 buffer_capacity=args.buffer_capacity,
-                max_policy_lag=args.max_policy_lag,
                 total_updates=args.total_updates,
                 seed=args.seed,
                 explored_chunk_weight=args.explored_chunk_weight,

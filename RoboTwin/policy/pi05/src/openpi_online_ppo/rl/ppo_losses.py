@@ -5,23 +5,22 @@ import numpy as np
 from .chunk_types import ChunkSample
 
 
+def compute_default_advantage(sample: ChunkSample) -> float:
+    del sample
+    return 0.0
+
+
 def compute_chunk_td_targets(samples: list[ChunkSample], gamma: float) -> None:
+    del gamma
     for sample in samples:
-        reward = float(sample.reward)
-        value = float(sample.value)
-        next_value = float(sample.next_value)
-        bootstrap_mask = float(sample.bootstrap_mask)
-        phase_bootstrap_mask = 0.0
-        if (
-            sample.phase_class is not None
-            and sample.next_phase_class is not None
-            and int(sample.phase_class) > 0
-            and int(sample.phase_class) == int(sample.next_phase_class)
-        ):
-            phase_bootstrap_mask = 1.0
-        effective_bootstrap = bootstrap_mask * phase_bootstrap_mask
-        sample.advantage = reward + gamma * effective_bootstrap * next_value - value
-        sample.value_target = reward + gamma * effective_bootstrap * next_value
+        if bool(sample.uses_value) and np.isfinite(sample.value) and np.isfinite(sample.next_value):
+            value = float(sample.value)
+            next_value = float(sample.next_value)
+            sample.advantage = (next_value - value) / 5.0 + 0.1
+            sample.value_target = next_value
+        else:
+            sample.advantage = compute_default_advantage(sample)
+            sample.value_target = float("nan")
 
 
 def normalize_advantages(samples: list[ChunkSample], eps: float = 1e-8) -> None:

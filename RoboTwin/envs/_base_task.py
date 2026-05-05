@@ -23,6 +23,7 @@ from pathlib import Path
 import trimesh
 import imageio
 import glob
+import time
 
 
 from ._GLOBAL_CONFIGS import *
@@ -96,6 +97,8 @@ class Base_Task(gym.Env):
         self.real_head_pcl_color = None
 
         self.now_obs = {}
+        self.last_collect_obs_timing = {}
+        self.last_take_action_timing = {}
         self.take_action_cnt = 0
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
 
@@ -211,9 +214,10 @@ class Base_Task(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
+        # Middle ground: keep ray tracing for better edges, but reduce sampling cost.
         sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
+        sapien.render.set_ray_tracing_samples_per_pixel(4)
+        sapien.render.set_ray_tracing_path_depth(2)
         sapien.render.set_ray_tracing_denoiser("oidn")
 
         # declare sapien scene
@@ -434,9 +438,30 @@ class Base_Task(gym.Env):
 
     # =========================================================== Basic APIs ===========================================================
 
-    def get_obs(self):
-        self._update_render()
+    def _collect_obs(self, *, do_update_render: bool = True):
+        collect_t0 = time.perf_counter()
+        timing = {
+            "do_update_render": bool(do_update_render),
+            "update_render_s": 0.0,
+            "update_picture_s": 0.0,
+            "get_config_s": 0.0,
+            "get_rgb_s": 0.0,
+            "third_view_s": 0.0,
+            "mesh_segmentation_s": 0.0,
+            "actor_segmentation_s": 0.0,
+            "depth_s": 0.0,
+            "endpose_s": 0.0,
+            "qpos_s": 0.0,
+            "pointcloud_s": 0.0,
+            "deepcopy_s": 0.0,
+        }
+        if do_update_render:
+            t0 = time.perf_counter()
+            self._update_render()
+            timing["update_render_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         self.cameras.update_picture()
+        timing["update_picture_s"] = time.perf_counter() - t0
         pkl_dic = {
             "observation": {},
             "pointcloud": [],
@@ -444,33 +469,46 @@ class Base_Task(gym.Env):
             "endpose": {},
         }
 
+        t0 = time.perf_counter()
         pkl_dic["observation"] = self.cameras.get_config()
+        timing["get_config_s"] = time.perf_counter() - t0
         # rgb
         if self.data_type.get("rgb", False):
+            t0 = time.perf_counter()
             rgb = self.cameras.get_rgb()
             for camera_name in rgb.keys():
                 pkl_dic["observation"][camera_name].update(rgb[camera_name])
+            timing["get_rgb_s"] = time.perf_counter() - t0
 
         if self.data_type.get("third_view", False):
+            t0 = time.perf_counter()
             third_view_rgb = self.cameras.get_observer_rgb()
             pkl_dic["third_view_rgb"] = third_view_rgb
+            timing["third_view_s"] = time.perf_counter() - t0
         # mesh_segmentation
         if self.data_type.get("mesh_segmentation", False):
+            t0 = time.perf_counter()
             mesh_segmentation = self.cameras.get_segmentation(level="mesh")
             for camera_name in mesh_segmentation.keys():
                 pkl_dic["observation"][camera_name].update(mesh_segmentation[camera_name])
+            timing["mesh_segmentation_s"] = time.perf_counter() - t0
         # actor_segmentation
         if self.data_type.get("actor_segmentation", False):
+            t0 = time.perf_counter()
             actor_segmentation = self.cameras.get_segmentation(level="actor")
             for camera_name in actor_segmentation.keys():
                 pkl_dic["observation"][camera_name].update(actor_segmentation[camera_name])
+            timing["actor_segmentation_s"] = time.perf_counter() - t0
         # depth
         if self.data_type.get("depth", False):
+            t0 = time.perf_counter()
             depth = self.cameras.get_depth()
             for camera_name in depth.keys():
                 pkl_dic["observation"][camera_name].update(depth[camera_name])
+            timing["depth_s"] = time.perf_counter() - t0
         # endpose
         if self.data_type.get("endpose", False):
+            t0 = time.perf_counter()
             norm_gripper_val = [
                 self.robot.get_left_gripper_val(),
                 self.robot.get_right_gripper_val(),
@@ -481,9 +519,10 @@ class Base_Task(gym.Env):
             pkl_dic["endpose"]["left_gripper"] = norm_gripper_val[0]
             pkl_dic["endpose"]["right_endpose"] = right_endpose
             pkl_dic["endpose"]["right_gripper"] = norm_gripper_val[1]
+            timing["endpose_s"] = time.perf_counter() - t0
         # qpos
         if self.data_type.get("qpos", False):
-
+            t0 = time.perf_counter()
             left_jointstate = self.robot.get_left_arm_jointState()
             right_jointstate = self.robot.get_right_arm_jointState()
 
@@ -492,12 +531,22 @@ class Base_Task(gym.Env):
             pkl_dic["joint_action"]["right_arm"] = right_jointstate[:-1]
             pkl_dic["joint_action"]["right_gripper"] = right_jointstate[-1]
             pkl_dic["joint_action"]["vector"] = np.array(left_jointstate + right_jointstate)
+            timing["qpos_s"] = time.perf_counter() - t0
         # pointcloud
         if self.data_type.get("pointcloud", False):
+            t0 = time.perf_counter()
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
+            timing["pointcloud_s"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         self.now_obs = deepcopy(pkl_dic)
+        timing["deepcopy_s"] = time.perf_counter() - t0
+        timing["total_s"] = time.perf_counter() - collect_t0
+        self.last_collect_obs_timing = timing
         return pkl_dic
+
+    def get_obs(self):
+        return self._collect_obs(do_update_render=True)
 
     def save_camera_rgb(self, save_path, camera_name='head_camera'):
         self._update_render()
@@ -1476,9 +1525,38 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
-    def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
+    def take_action(
+        self,
+        action,
+        action_type:Literal['qpos', 'ee']='qpos',
+        *,
+        return_obs: bool = False,
+    ):  # action_type: qpos or ee
+        take_action_t0 = time.perf_counter()
+        timing = {
+            "action_type": str(action_type),
+            "initial_update_render_s": 0.0,
+            "initial_viewer_render_s": 0.0,
+            "planning_s": 0.0,
+            "gripper_interp_s": 0.0,
+            "control_loop_s": 0.0,
+            "control_loop_iters": 0,
+            "scene_step_s": 0.0,
+            "loop_update_render_s": 0.0,
+            "check_success_s": 0.0,
+            "success_collect_obs_s": 0.0,
+            "final_update_render_s": 0.0,
+            "final_viewer_render_s": 0.0,
+            "final_collect_obs_s": 0.0,
+            "left_plan_steps": 0,
+            "right_plan_steps": 0,
+            "left_plan_success": False,
+            "right_plan_success": False,
+        }
         if self.take_action_cnt == self.step_lim or self.eval_success:
-            return
+            timing["total_s"] = time.perf_counter() - take_action_t0
+            self.last_take_action_timing = timing
+            return self.now_obs if return_obs else None
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
@@ -1487,9 +1565,13 @@ class Base_Task(gym.Env):
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
+        t0 = time.perf_counter()
         self._update_render()
+        timing["initial_update_render_s"] = time.perf_counter() - t0
         if self.render_freq:
+            t0 = time.perf_counter()
             self.viewer.render()
+            timing["initial_viewer_render_s"] = time.perf_counter() - t0
 
         actions = np.array([action])
         left_jointstate = self.robot.get_left_arm_jointState()
@@ -1528,6 +1610,7 @@ class Base_Task(gym.Env):
         right_gripper_path = np.hstack((right_current_gripper, right_gripper_actions))
 
         if action_type == 'qpos':
+            planning_t0 = time.perf_counter()
             left_current_qpos, right_current_qpos = (
                 current_jointstate[:left_arm_dim],
                 current_jointstate[left_arm_dim + 1:left_arm_dim + right_arm_dim + 1],
@@ -1570,9 +1653,14 @@ class Base_Task(gym.Env):
             if right_n_step == 0:
                 topp_right_flag = False
                 right_n_step = 50  # fixed
+            timing["planning_s"] = time.perf_counter() - planning_t0
+            timing["left_plan_steps"] = int(left_n_step)
+            timing["right_plan_steps"] = int(right_n_step)
+            timing["left_plan_success"] = bool(topp_left_flag)
+            timing["right_plan_success"] = bool(topp_right_flag)
         
         elif action_type == 'ee':
-
+            planning_t0 = time.perf_counter()
             left_result = self.robot.left_plan_path(left_arm_actions[0])
             right_result = self.robot.right_plan_path(right_arm_actions[0])
             if left_result["status"] != "Success":
@@ -1590,8 +1678,14 @@ class Base_Task(gym.Env):
             else:
                 right_n_step = right_result["position"].shape[0]
                 topp_right_flag = True
+            timing["planning_s"] = time.perf_counter() - planning_t0
+            timing["left_plan_steps"] = int(left_n_step)
+            timing["right_plan_steps"] = int(right_n_step)
+            timing["left_plan_success"] = bool(topp_left_flag)
+            timing["right_plan_success"] = bool(topp_right_flag)
 
         # ========== Gripper ==========
+        gripper_t0 = time.perf_counter()
 
         left_mod_num = left_n_step % len(left_gripper_actions)
         right_mod_num = right_n_step % len(right_gripper_actions)
@@ -1623,11 +1717,14 @@ class Base_Task(gym.Env):
             )[1:]
             right_gripper = right_gripper + region_right_gripper.tolist()
         right_gripper = np.array(right_gripper)
+        timing["gripper_interp_s"] = time.perf_counter() - gripper_t0
 
         now_left_id, now_right_id = 0, 0
 
         # ========== Control Loop ==========
+        control_loop_t0 = time.perf_counter()
         while now_left_id < left_n_step or now_right_id < right_n_step:
+            timing["control_loop_iters"] += 1
 
             if (now_left_id < left_n_step and now_left_id / left_n_step <= now_right_id / right_n_step):
                 if topp_left_flag:
@@ -1651,19 +1748,46 @@ class Base_Task(gym.Env):
 
                 now_right_id += 1
 
+            t0 = time.perf_counter()
             self.scene.step()
+            timing["scene_step_s"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
             self._update_render()
+            timing["loop_update_render_s"] += time.perf_counter() - t0
                 
-            if self.check_success():
+            t0 = time.perf_counter()
+            success = self.check_success()
+            timing["check_success_s"] += time.perf_counter() - t0
+            if success:
                 self.eval_success = True
-                self.get_obs() # update obs
+                t0 = time.perf_counter()
+                obs = self._collect_obs(do_update_render=False)
+                timing["success_collect_obs_s"] = time.perf_counter() - t0
+                timing["control_loop_s"] = time.perf_counter() - control_loop_t0
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
-                return
+                timing["total_s"] = time.perf_counter() - take_action_t0
+                self.last_take_action_timing = timing
+                return obs if return_obs else None
+        timing["control_loop_s"] = time.perf_counter() - control_loop_t0
 
+        t0 = time.perf_counter()
         self._update_render()
+        timing["final_update_render_s"] = time.perf_counter() - t0
         if self.render_freq:  # UI
+            t0 = time.perf_counter()
             self.viewer.render()
+            timing["final_viewer_render_s"] = time.perf_counter() - t0
+        if return_obs:
+            t0 = time.perf_counter()
+            obs = self._collect_obs(do_update_render=False)
+            timing["final_collect_obs_s"] = time.perf_counter() - t0
+            timing["total_s"] = time.perf_counter() - take_action_t0
+            self.last_take_action_timing = timing
+            return obs
+        timing["total_s"] = time.perf_counter() - take_action_t0
+        self.last_take_action_timing = timing
+        return None
 
 
     def save_camera_images(self, task_name, step_name, generate_num_id, save_dir="./camera_images"):

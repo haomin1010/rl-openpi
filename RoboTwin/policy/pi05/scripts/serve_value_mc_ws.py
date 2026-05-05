@@ -12,6 +12,7 @@ import multiprocessing
 import os
 import pathlib
 import pickle
+import time
 from typing import Any
 
 import flax.nnx as nnx
@@ -39,6 +40,7 @@ from openpi_online_ppo.rl.pi0_value_policy import create_pi0_value_policy
 from openpi_online_ppo.rl.pi0_fast_policy import create_trained_pi0_fast_rl_policy
 
 log = logging.getLogger("value_mc_ws")
+timing_log = logging.getLogger("value_mc_ws.timing")
 
 KEYFRAME_NUM_BINS = 16
 
@@ -114,6 +116,7 @@ def _build_input_transform(
     tasks: dict[int, str] | None,
     checkpoint_dir: str | None,
     prompt_from_task: bool = True,
+    include_repack_inputs: bool = True,
 ) -> _transforms.DataTransformFn:
     data_config = cfg.data.create(cfg.assets_dirs, cfg.model)
     norm_stats = data_config.norm_stats
@@ -128,11 +131,29 @@ def _build_input_transform(
         if tasks is None:
             raise ValueError("Prompt-from-task transform requires dataset task metadata.")
         transforms.append(_transforms.PromptFromLeRobotTask(tasks))
-    transforms.extend(data_config.repack_transforms.inputs)
+    if include_repack_inputs:
+        transforms.extend(data_config.repack_transforms.inputs)
     transforms.extend(data_config.data_transforms.inputs)
     transforms.append(_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm))
     transforms.extend(data_config.model_transforms.inputs)
     return _transforms.compose(transforms)
+
+
+def _configure_timing_logger(path: str | None) -> logging.Logger:
+    logger = logging.getLogger("value_mc_ws.timing")
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not path:
+        logger.disabled = True
+        return logger
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.disabled = False
+    logger.info(json.dumps({"event": "timing_log_started", "path": str(path)}, ensure_ascii=True, sort_keys=True))
+    return logger
 
 
 def _row_to_transformed_obs(
@@ -429,6 +450,7 @@ class ValueMCService:
             raise TypeError(f"Unsupported model type for value service: {type(cfg.model).__name__}")
         log.info("RL policy loaded; initializing value/keyframe service state")
         self._model = policy.model
+        self._compiled_model_def, self._compiled_model_state = nnx.split(self._model)
         self._train_config = cfg
         self._checkpoint_dir = str(pathlib.Path(policy_path).resolve()) if policy_path else None
         # Freeze backbone; train only lightweight aux input + task heads.
@@ -438,6 +460,15 @@ class ValueMCService:
         model_state = nnx.state(self._model)
         self._value_opt_state = self._tx.init(model_state.filter(self._value_filter))
         self._keyframe_opt_state = self._tx.init(model_state.filter(self._keyframe_filter))
+        self._live_input_transform = _build_input_transform(
+            self._train_config,
+            tasks=None,
+            checkpoint_dir=self._checkpoint_dir,
+            prompt_from_task=False,
+            include_repack_inputs=False,
+        )
+        self._phase_to_class: dict[str, int] = {}
+        self._class_to_phase: dict[int, str] = {}
         self._mc_epochs = max(1, int(mc_epochs))
         self._mc_batch_size = max(1, int(mc_batch_size))
         self._mc_gamma = float(mc_gamma)
@@ -453,6 +484,27 @@ class ValueMCService:
 
         if init_state_file:
             self.load_state_from_file(init_state_file, load_optimizer_state=True)
+        self._init_stateful_compiled_predictors()
+
+    def _sync_compiled_state_from_model(self) -> None:
+        self._compiled_model_state = nnx.state(self._model)
+
+    def _init_stateful_compiled_predictors(self) -> None:
+        def _predict_value_fn(state: nnx.State, observation: _model.Observation) -> jax.Array:
+            model = nnx.merge(self._compiled_model_def, state)
+            return model.predict_value(observation)
+
+        def _predict_keyframe_prob_fn(state: nnx.State, observation: _model.Observation) -> jax.Array:
+            model = nnx.merge(self._compiled_model_def, state)
+            return model.predict_keyframe_prob(observation, stop_gradient=True)
+
+        def _predict_keyframe_class_fn(state: nnx.State, observation: _model.Observation) -> jax.Array:
+            model = nnx.merge(self._compiled_model_def, state)
+            return model.predict_keyframe_class(observation, stop_gradient=True)
+
+        self._predict_value_jit = jax.jit(_predict_value_fn)
+        self._predict_keyframe_prob_jit = jax.jit(_predict_keyframe_prob_fn)
+        self._predict_keyframe_class_jit = jax.jit(_predict_keyframe_class_fn)
 
     @staticmethod
     def _resolve_success_bool(value: Any) -> bool:
@@ -482,15 +534,155 @@ class ValueMCService:
         observation = _model.Observation.from_dict(
             jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], transformed_obs)
         )
-        value = self._model.predict_value(observation)[0]
+        value = self._predict_value_jit(self._compiled_model_state, observation)[0]
         return float(np.asarray(value))
 
+    def predict_batch(self, transformed_obs_batch: list[dict[str, Any]]) -> list[float]:
+        if not transformed_obs_batch:
+            return []
+        observation = _model.Observation.from_dict(
+            jax.tree.map(
+                lambda *xs: jnp.asarray(np.stack([np.asarray(x) for x in xs], axis=0)),
+                *transformed_obs_batch,
+            )
+        )
+        values = self._predict_value_jit(self._compiled_model_state, observation)
+        return [float(x) for x in np.asarray(values, dtype=np.float32).tolist()]
+
+    def _transform_live_observation(
+        self,
+        obs: dict[str, Any],
+        *,
+        prompt_override: str | None = None,
+    ) -> dict[str, Any]:
+        payload = jax.tree.map(lambda x: x, obs)
+        if prompt_override is not None:
+            payload["prompt"] = str(prompt_override)
+        out = dict(self._live_input_transform(payload))
+        out.pop("actions", None)
+        return out
+
+    def predict_phase_value(self, obs: dict[str, Any], phase_class: int) -> float:
+        total_t0 = time.perf_counter()
+        prompt_override = None
+        phase_idx = int(phase_class)
+        if phase_idx > 0:
+            phase_name = self._class_to_phase.get(phase_idx)
+            if phase_name:
+                base_prompt = str(obs.get("prompt", "")).strip()
+                prompt_override = _compose_phase_prompt(base_prompt, phase_name)
+        transform_t0 = time.perf_counter()
+        transformed_obs = self._transform_live_observation(obs, prompt_override=prompt_override)
+        transform_s = time.perf_counter() - transform_t0
+        forward_t0 = time.perf_counter()
+        value = self.predict(transformed_obs)
+        forward_s = time.perf_counter() - forward_t0
+        if not timing_log.disabled:
+            timing_log.info(
+                json.dumps(
+                    {
+                        "event": "predict_phase_value",
+                        "phase_class": int(phase_class),
+                        "transform_s": transform_s,
+                        "forward_s": forward_s,
+                        "total_s": time.perf_counter() - total_t0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+        return value
+
+    def predict_phase_value_batch(self, obs_batch: list[dict[str, Any]], phase_class: int) -> list[float]:
+        total_t0 = time.perf_counter()
+        if not obs_batch:
+            return []
+        prompt_override = None
+        phase_idx = int(phase_class)
+        if phase_idx > 0:
+            phase_name = self._class_to_phase.get(phase_idx)
+            if phase_name:
+                prompt_override = phase_name
+        transformed_batch: list[dict[str, Any]] = []
+        transform_t0 = time.perf_counter()
+        for obs in obs_batch:
+            per_prompt_override = None
+            if prompt_override is not None:
+                base_prompt = str(obs.get("prompt", "")).strip()
+                per_prompt_override = _compose_phase_prompt(base_prompt, prompt_override)
+            transformed_batch.append(
+                self._transform_live_observation(obs, prompt_override=per_prompt_override)
+            )
+        transform_s = time.perf_counter() - transform_t0
+        forward_t0 = time.perf_counter()
+        values = self.predict_batch(transformed_batch)
+        forward_s = time.perf_counter() - forward_t0
+        if not timing_log.disabled:
+            timing_log.info(
+                json.dumps(
+                    {
+                        "event": "predict_phase_value_batch",
+                        "phase_class": int(phase_class),
+                        "batch_size": int(len(obs_batch)),
+                        "transform_s": transform_s,
+                        "forward_s": forward_s,
+                        "total_s": time.perf_counter() - total_t0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+        return values
+
     def predict_keyframe(self, transformed_obs: dict[str, Any]) -> float:
+        total_t0 = time.perf_counter()
         observation = _model.Observation.from_dict(
             jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], transformed_obs)
         )
-        prob = self._model.predict_keyframe_prob(observation, stop_gradient=True)[0]
-        return float(np.asarray(prob))
+        build_obs_s = time.perf_counter() - total_t0
+        forward_t0 = time.perf_counter()
+        prob = self._predict_keyframe_prob_jit(self._compiled_model_state, observation)[0]
+        forward_s = time.perf_counter() - forward_t0
+        out = float(np.asarray(prob))
+        if not timing_log.disabled:
+            timing_log.info(
+                json.dumps(
+                    {
+                        "event": "predict_keyframe",
+                        "build_obs_s": build_obs_s,
+                        "forward_s": forward_s,
+                        "total_s": time.perf_counter() - total_t0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+        return out
+
+    def predict_keyframe_class(self, transformed_obs: dict[str, Any]) -> int:
+        total_t0 = time.perf_counter()
+        observation = _model.Observation.from_dict(
+            jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], transformed_obs)
+        )
+        build_obs_s = time.perf_counter() - total_t0
+        forward_t0 = time.perf_counter()
+        klass = self._predict_keyframe_class_jit(self._compiled_model_state, observation)[0]
+        forward_s = time.perf_counter() - forward_t0
+        out = int(np.asarray(klass))
+        if not timing_log.disabled:
+            timing_log.info(
+                json.dumps(
+                    {
+                        "event": "predict_keyframe_class",
+                        "build_obs_s": build_obs_s,
+                        "forward_s": forward_s,
+                        "total_s": time.perf_counter() - total_t0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+        return out
 
     def sync_params_from_file(self, params_file: str) -> None:
         path = pathlib.Path(params_file)
@@ -499,6 +691,7 @@ class ValueMCService:
         state = nnx.state(self._model)
         state.replace_by_pure_dict(pure)
         nnx.update(self._model, state)
+        self._sync_compiled_state_from_model()
 
     @staticmethod
     def _dump_pickle_atomic(path: pathlib.Path, payload: Any) -> None:
@@ -513,6 +706,8 @@ class ValueMCService:
         payload: dict[str, Any] = {
             "format": "openpi_value_mc_state_v1",
             "params_pure": nnx.state(self._model).to_pure_dict(),
+            "phase_to_class": dict(self._phase_to_class),
+            "class_to_phase": dict(self._class_to_phase),
         }
         if include_optimizer_state:
             payload["value_opt_state"] = self._value_opt_state
@@ -530,21 +725,30 @@ class ValueMCService:
             pure = payload["params_pure"]
             value_opt_state = payload.get("value_opt_state")
             keyframe_opt_state = payload.get("keyframe_opt_state")
+            phase_to_class = payload.get("phase_to_class")
+            class_to_phase = payload.get("class_to_phase")
         else:
             # Backward-compatible: raw pure params dict.
             pure = payload
             value_opt_state = None
             keyframe_opt_state = None
+            phase_to_class = None
+            class_to_phase = None
 
         state = nnx.state(self._model)
         state.replace_by_pure_dict(pure)
         nnx.update(self._model, state)
+        self._sync_compiled_state_from_model()
 
         if load_optimizer_state:
             if value_opt_state is not None:
                 self._value_opt_state = value_opt_state
             if keyframe_opt_state is not None:
                 self._keyframe_opt_state = keyframe_opt_state
+        if isinstance(phase_to_class, dict):
+            self._phase_to_class = {str(k): int(v) for k, v in phase_to_class.items()}
+        if isinstance(class_to_phase, dict):
+            self._class_to_phase = {int(k): str(v) for k, v in class_to_phase.items()}
         log.info("loaded value/keyframe state: %s", path)
 
     def _autosave_after_train(self, stage: str) -> str | None:
@@ -618,6 +822,7 @@ class ValueMCService:
         updates, self._value_opt_state = self._tx.update(grads, self._value_opt_state, params)
         new_params = optax.apply_updates(params, updates)
         nnx.update(model, new_params)
+        self._sync_compiled_state_from_model()
         metrics = {
             **metrics,
             "value_grad_norm": optax.global_norm(grads),
@@ -654,6 +859,7 @@ class ValueMCService:
         updates, self._keyframe_opt_state = self._tx.update(grads, self._keyframe_opt_state, params)
         new_params = optax.apply_updates(params, updates)
         nnx.update(model, new_params)
+        self._sync_compiled_state_from_model()
         metrics = {
             **metrics,
             "keyframe_grad_norm": optax.global_norm(grads),
@@ -1072,6 +1278,8 @@ class ValueMCService:
         ann_eps = _parse_keyphase_annotations(annotations_json)
         phase_names = _load_keyphase_phase_names(annotations_json)
         phase_to_class = {name: idx + 1 for idx, name in enumerate(phase_names)}
+        self._phase_to_class = dict(phase_to_class)
+        self._class_to_phase = {idx: name for name, idx in phase_to_class.items()}
 
         ensure_local_hf_cache()
         ds = LeRobotDataset(repo_id=repo_id, root=dataset_root)
@@ -1188,16 +1396,37 @@ class ValueMCWebsocketServer:
         log.info("client connected: %s", websocket.remote_address)
         while True:
             try:
-                msg = msgpack_numpy.unpackb(await websocket.recv())
+                recv_t0 = time.perf_counter()
+                raw_msg = await websocket.recv()
+                recv_wait_s = time.perf_counter() - recv_t0
+                unpack_t0 = time.perf_counter()
+                msg = msgpack_numpy.unpackb(raw_msg)
+                unpack_s = time.perf_counter() - unpack_t0
                 if not isinstance(msg, dict):
                     raise TypeError(f"Expected dict payload, got {type(msg)}")
                 cmd = msg.get("cmd")
+                compute_t0 = time.perf_counter()
                 if cmd == "predict":
                     value = self._service.predict(dict(msg["observation"]))
                     resp = {"value": value}
+                elif cmd == "predict_phase_value":
+                    value = self._service.predict_phase_value(
+                        dict(msg["observation"]),
+                        int(msg["phase_class"]),
+                    )
+                    resp = {"value": value}
+                elif cmd == "predict_phase_value_batch":
+                    values = self._service.predict_phase_value_batch(
+                        [dict(obs) for obs in msg["observations"]],
+                        int(msg["phase_class"]),
+                    )
+                    resp = {"values": values}
                 elif cmd == "predict_keyframe":
                     keyframe_prob = self._service.predict_keyframe(dict(msg["observation"]))
                     resp = {"keyframe_prob": keyframe_prob}
+                elif cmd == "predict_keyframe_class":
+                    phase_class = self._service.predict_keyframe_class(dict(msg["observation"]))
+                    resp = {"phase_class": phase_class}
                 elif cmd == "sync_params_from_file":
                     self._service.sync_params_from_file(str(msg["params_file"]))
                     resp = {"ok": True}
@@ -1250,7 +1479,32 @@ class ValueMCWebsocketServer:
                     }
                 else:
                     raise ValueError(f"Unknown command: {cmd}")
-                await websocket.send(packer.pack(resp))
+                compute_s = time.perf_counter() - compute_t0
+                pack_t0 = time.perf_counter()
+                packed = packer.pack(resp)
+                pack_s = time.perf_counter() - pack_t0
+                send_t0 = time.perf_counter()
+                await websocket.send(packed)
+                send_s = time.perf_counter() - send_t0
+                if not timing_log.disabled:
+                    timing_log.info(
+                        json.dumps(
+                            {
+                                "event": "ws_handler_request",
+                                "cmd": str(cmd),
+                                "recv_wait_s": recv_wait_s,
+                                "unpack_s": unpack_s,
+                                "compute_s": compute_s,
+                                "pack_s": pack_s,
+                                "send_s": send_s,
+                                "total_s": recv_wait_s + unpack_s + compute_s + pack_s + send_s,
+                                "request_bytes": int(len(raw_msg)) if isinstance(raw_msg, (bytes, bytearray)) else None,
+                                "response_bytes": int(len(packed)),
+                            },
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        )
+                    )
             except websockets.ConnectionClosed:
                 log.info("client disconnected: %s", websocket.remote_address)
                 return
@@ -1329,12 +1583,14 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional checkpoint file to load at service startup.",
     )
+    p.add_argument("--timing_log_file", type=str, default=None)
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", force=True)
+    _configure_timing_logger(args.timing_log_file)
     service = ValueMCService(
         policy_config=args.policy_config,
         policy_path=args.policy_path,

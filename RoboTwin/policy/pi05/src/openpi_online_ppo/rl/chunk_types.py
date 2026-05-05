@@ -18,13 +18,15 @@ class ChunkSample:
     reward: float
     value: float
     next_value: float
+    uses_value: bool = False
+    chunk_prefix_observations: list[dict[str, Any]] | None = None
+    chunk_suffix_observations: list[dict[str, Any]] | None = None
     sampled_action_tokens: np.ndarray | None = None
     sampled_action_token_mask: np.ndarray | None = None
     sampled_dct_coeffs: np.ndarray | None = None
     executed_dct_coeffs: np.ndarray | None = None
     keyframe_prob: float | None = None
     phase_class: int | None = None
-    next_phase_class: int | None = None
     exploration_applied: bool = False
     bootstrap_mask: float = 1.0
     advantage: float | None = None
@@ -32,5 +34,4 @@ class ChunkSample:
     task: str | None = None
     done: bool = False
     done_reason: str | None = None
-    policy_version: int = 0
     step_id: int = 0

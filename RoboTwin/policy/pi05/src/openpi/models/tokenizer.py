@@ -81,6 +81,24 @@ class FASTTokenizer:
             raise ValueError("Failed to tokenize '|' separator for FAST action parsing.")
         self._action_sep_token = int(bar_tokens[0])
 
+    def _infer_fast_vocab_size(self) -> int:
+        bpe = self._fast_tokenizer.bpe_tokenizer
+        for attr in ("get_vocab_size", "vocab_size"):
+            candidate = getattr(bpe, attr, None)
+            if callable(candidate):
+                try:
+                    return int(candidate())
+                except TypeError:
+                    pass
+            elif candidate is not None:
+                return int(candidate)
+        get_vocab = getattr(bpe, "get_vocab", None)
+        if callable(get_vocab):
+            vocab = get_vocab()
+            if isinstance(vocab, dict):
+                return int(len(vocab))
+        raise AttributeError("Unable to infer FAST BPE vocabulary size from tokenizer.")
+
     @property
     def rowwise_bpe(self) -> bool:
         return bool(self._rowwise_bpe)
@@ -245,6 +263,15 @@ class FASTTokenizer:
 
     def action_suffix_tokens(self, *, add_eos: bool = True) -> np.ndarray:
         return np.asarray(self._paligemma_tokenizer.encode("|", add_eos=add_eos), dtype=np.int32)
+
+    def fast_vocab_size(self) -> int:
+        return int(self._infer_fast_vocab_size())
+
+    def action_pg_token_ids(self) -> np.ndarray:
+        return self._act_tokens_to_paligemma_tokens(np.arange(self.fast_vocab_size(), dtype=np.int32))
+
+    def pg_tokens_to_fast_tokens(self, pg_tokens: np.ndarray | list[int]) -> np.ndarray:
+        return np.asarray(self._pg_tokens_to_fast_tokens(pg_tokens), dtype=np.int32)
 
     def decode_action_dct_coeffs(self, dct_coeffs: np.ndarray) -> np.ndarray:
         coeffs = np.asarray(dct_coeffs, dtype=np.float32)

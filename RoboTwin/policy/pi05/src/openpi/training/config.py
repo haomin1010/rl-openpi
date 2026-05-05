@@ -793,11 +793,6 @@ _CONFIGS = [
         model=pi0_fast.Pi0FASTConfig(
             action_dim=14,
             action_horizon=32,
-            fast_model_tokenizer_kwargs={
-                "transpose_dct_before_bpe": True,
-                "rowwise_bpe": True,
-                "rowwise_layout": "action_dim_major",
-            },
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot-hammer-clean-100-ee_delta",
@@ -830,11 +825,6 @@ _CONFIGS = [
         model=pi0_fast.Pi0FASTConfig(
             action_dim=14,
             action_horizon=32,
-            fast_model_tokenizer_kwargs={
-                "transpose_dct_before_bpe": True,
-                "rowwise_bpe": True,
-                "rowwise_layout": "action_dim_major",
-            },
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot-hammer-clean-100-ee_delta",

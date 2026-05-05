@@ -120,7 +120,7 @@ def _mlp_forward(params: list[dict[str, jnp.ndarray]], x: jnp.ndarray) -> jnp.nd
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train per-dimension diagonal Gaussian sigma net in DCT space.")
+    p = argparse.ArgumentParser(description="Train low-frequency/action-dim block sigma net in DCT space.")
     p.add_argument("--dataset_root", type=str, required=True)
     p.add_argument("--repo_id", type=str, required=True)
     p.add_argument("--annotations_json", type=str, required=True)
@@ -131,8 +131,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--noise_dct_keep_k",
         type=int,
-        default=0,
-        help="If > 0, only the first K DCT coefficients per action dimension are allowed to receive noise.",
+        default=4,
+        help="Number of low-frequency DCT rows included in sigma prediction and perturbation.",
     )
     p.add_argument("--fast_tokenizer_path", type=str, default="physical-intelligence/fast")
     p.add_argument("--hidden_dim", type=int, default=256)
@@ -228,21 +228,17 @@ def main() -> None:
     dct_mat = _build_ortho_dct_matrix(chunk_size)
     dct_chunks = (np.einsum("tk,nta->nka", dct_mat, chunk_arr) * dct_scale).astype(np.float32)
 
-    dimwise_inputs: list[np.ndarray] = []
-    dimwise_dims: list[int] = []
-    for chunk_idx in range(chunk_arr.shape[0]):
-        for dim_idx in allowed_dims:
-            onehot = np.zeros((action_dim,), dtype=np.float32)
-            onehot[int(dim_idx)] = 1.0
-            x = np.concatenate([dct_chunks[chunk_idx, :, int(dim_idx)], onehot], axis=0)
-            dimwise_inputs.append(x.astype(np.float32))
-            dimwise_dims.append(int(dim_idx))
-    x_arr = np.stack(dimwise_inputs, axis=0).astype(np.float32)
-    dim_arr = np.asarray(dimwise_dims, dtype=np.int32)
-    chunk_idx_arr = np.repeat(np.arange(chunk_arr.shape[0], dtype=np.int32), len(allowed_dims))
+    noise_dct_keep_k = int(args.noise_dct_keep_k)
+    if noise_dct_keep_k <= 0:
+        raise ValueError("--noise_dct_keep_k must be > 0")
+    effective_keep_k = min(chunk_size, noise_dct_keep_k)
+    if not allowed_dims:
+        raise ValueError("No valid action dims selected for sigma net training.")
+
+    x_arr = dct_chunks[:, :effective_keep_k, :][:, :, allowed_dims].reshape(chunk_arr.shape[0], -1).astype(np.float32)
 
     in_dim = int(x_arr.shape[1])
-    out_dim = int(chunk_size)
+    out_dim = int(x_arr.shape[1])
     x_mean = np.mean(x_arr, axis=0, keepdims=True).astype(np.float32)
     x_std = np.std(x_arr, axis=0, keepdims=True).astype(np.float32)
     x_std = np.where(x_std < 1e-6, 1.0, x_std).astype(np.float32)
@@ -271,11 +267,8 @@ def main() -> None:
     if threshold <= 0:
         raise ValueError("--action_delta_limit * --constraint_margin must be > 0")
     reward_scale = max(1e-6, threshold * float(args.reward_scale_ratio))
-    noise_dct_keep_k = int(args.noise_dct_keep_k)
-    if noise_dct_keep_k < 0:
-        raise ValueError("--noise_dct_keep_k must be >= 0")
-    effective_keep_k = chunk_size if noise_dct_keep_k <= 0 else min(chunk_size, noise_dct_keep_k)
-    noise_mask_j = jnp.zeros((chunk_size,), dtype=jnp.float32).at[:effective_keep_k].set(1.0)
+    allowed_dims_j = jnp.asarray(np.asarray(allowed_dims, dtype=np.int32))
+    dct_shape = (effective_keep_k, len(allowed_dims))
 
     @jax.jit
     def train_step(
@@ -290,9 +283,11 @@ def main() -> None:
             sigma = jax.nn.softplus(log_sigma) + sigma_min
             if sigma_max > 0:
                 sigma = jnp.clip(sigma, sigma_min, sigma_max)
-            sigma = sigma * noise_mask_j
-            delta_dct = sigma * eps_noise
-            delta_action = (dct_mat_inv @ (delta_dct / dct_scale_j)[..., None])[..., 0]
+            sigma = sigma.reshape((batch_x.shape[0],) + dct_shape)
+            delta_sub = sigma * eps_noise.reshape((batch_x.shape[0],) + dct_shape)
+            delta_dct = jnp.zeros((batch_x.shape[0], chunk_size, action_dim), dtype=jnp.float32)
+            delta_dct = delta_dct.at[:, :effective_keep_k, allowed_dims_j].set(delta_sub)
+            delta_action = jnp.einsum("tk,bka->bta", dct_mat_inv, delta_dct / dct_scale_j)
             per_step_abs = jnp.abs(delta_action)
             violation = jax.nn.relu(per_step_abs - threshold)
             penalty = jnp.mean((violation / threshold) ** penalty_power)
@@ -323,7 +318,7 @@ def main() -> None:
         for i in range(0, idx_all.shape[0], int(args.batch_size)):
             bi = idx_all[i : i + int(args.batch_size)]
             batch_x = x_arr[bi]
-            eps_noise = rng.normal(0.0, 1.0, size=(len(bi), chunk_size)).astype(np.float32)
+            eps_noise = rng.normal(0.0, 1.0, size=(len(bi), out_dim)).astype(np.float32)
             params, opt_state, metrics = train_step(
                 params,
                 opt_state,
@@ -360,17 +355,15 @@ def main() -> None:
             "action_delta_limit": float(args.action_delta_limit),
             "action_noise_dims": [int(x) for x in allowed_dims],
             "noise_dct_keep_k": int(effective_keep_k),
-            "target_construction": "dimwise_diag_gaussian_constraint",
+            "target_construction": "selected_dct_block_diag_gaussian_constraint",
         },
         "x_mean": x_mean.astype(np.float32),
         "x_std": x_std.astype(np.float32),
         "layers": layers_payload,
-        "chunk_index": chunk_idx_arr.astype(np.int32),
-        "dim_index": dim_arr.astype(np.int32),
     }
     with out.open("wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"Saved dimwise sigma perturb net checkpoint: {out}")
+    print(f"Saved sigma perturb net checkpoint: {out}")
 
 
 if __name__ == "__main__":

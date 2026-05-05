@@ -10,6 +10,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,25 @@ from openpi_client import msgpack_numpy
 from openpi_online_ppo.ee_delta import ee_exec_action16_from_delta_action14
 from openpi_online_ppo.ee_delta import ee_obs14_from_episode_ref
 from openpi_online_ppo.ee_delta import extract_raw_ee_from_env_obs
+
+ENV_TIMING_LOGGER_NAME = "robotwin_env_ws.timing"
+
+
+def _summary_stats(values: list[float], prefix: str) -> dict[str, float]:
+    if not values:
+        return {
+            f"{prefix}_sum_s": 0.0,
+            f"{prefix}_mean_s": 0.0,
+            f"{prefix}_max_s": 0.0,
+            f"{prefix}_p95_s": 0.0,
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        f"{prefix}_sum_s": float(np.sum(arr)),
+        f"{prefix}_mean_s": float(np.mean(arr)),
+        f"{prefix}_max_s": float(np.max(arr)),
+        f"{prefix}_p95_s": float(np.quantile(arr, 0.95)),
+    }
 
 
 def _resolve_repo_root(repo_root: str | None) -> pathlib.Path:
@@ -201,6 +221,36 @@ class EpisodeState:
     seed: int
     task_name: str
     prompt: str
+
+
+def _compare_raw_obs_summary(obs_a: dict[str, Any], obs_b: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "head_rgb_max_abs": 0,
+        "left_rgb_max_abs": 0,
+        "right_rgb_max_abs": 0,
+        "state_max_abs": 0.0,
+    }
+    try:
+        a_cam = obs_a["observation"]
+        b_cam = obs_b["observation"]
+        for key, out_key in (
+            ("head_camera", "head_rgb_max_abs"),
+            ("left_camera", "left_rgb_max_abs"),
+            ("right_camera", "right_rgb_max_abs"),
+        ):
+            if key in a_cam and key in b_cam and "rgb" in a_cam[key] and "rgb" in b_cam[key]:
+                diff = np.abs(
+                    np.asarray(a_cam[key]["rgb"], dtype=np.int16) - np.asarray(b_cam[key]["rgb"], dtype=np.int16)
+                )
+                result[out_key] = int(np.max(diff)) if diff.size else 0
+        if "joint_action" in obs_a and "joint_action" in obs_b:
+            avec = np.asarray(obs_a["joint_action"].get("vector", []), dtype=np.float32)
+            bvec = np.asarray(obs_b["joint_action"].get("vector", []), dtype=np.float32)
+            if avec.shape == bvec.shape and avec.size:
+                result["state_max_abs"] = float(np.max(np.abs(avec - bvec)))
+    except Exception as exc:
+        result["compare_error"] = repr(exc)
+    return result
 
 
 class LeRobotEnvDatasetWriter:
@@ -473,6 +523,24 @@ class LeRobotRoundDatasetManager:
 
 
 class RoboTwinEnvSession:
+    @staticmethod
+    def _configure_timing_logger(path: str | None) -> logging.Logger:
+        logger = logging.getLogger(ENV_TIMING_LOGGER_NAME)
+        logger.handlers.clear()
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        if not path:
+            logger.disabled = True
+            return logger
+        out = pathlib.Path(path).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(out, mode="w", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+        logger.disabled = False
+        logger.info(json.dumps({"event": "env_timing_log_started", "path": str(out)}, ensure_ascii=True, sort_keys=True))
+        return logger
+
     def __init__(
         self,
         *,
@@ -494,6 +562,9 @@ class RoboTwinEnvSession:
         lerobot_overwrite: bool,
         lerobot_resize_to_640x480: bool,
         control_mode: str,
+        use_take_action_obs: bool = False,
+        debug_compare_obs_every: int = 0,
+        timing_log_file: str | None = None,
     ) -> None:
         self._repo_root = repo_root
         self._task_name = task_name
@@ -511,8 +582,12 @@ class RoboTwinEnvSession:
         self._lerobot_manager: LeRobotRoundDatasetManager | None = None
         self._latest_raw_obs: dict[str, Any] | None = None
         self._control_mode = str(control_mode)
+        self._use_take_action_obs = bool(use_take_action_obs)
+        self._debug_compare_obs_every = max(0, int(debug_compare_obs_every))
+        self._debug_compare_obs_count = 0
         self._left_ref_quat: np.ndarray | None = None
         self._right_ref_quat: np.ndarray | None = None
+        self._timing_logger = self._configure_timing_logger(timing_log_file)
 
         self._task_env = _instantiate_task(repo_root, task_name)
         self._task_args = _build_task_args(repo_root, task_name, task_config)
@@ -781,14 +856,35 @@ class RoboTwinEnvSession:
                 f"`action_chunk` must have width 14 in ee_delta mode, got shape={action_chunk.shape}"
             )
 
+        total_t0 = time.perf_counter()
         consumed = 0
         current_raw_obs = self._latest_raw_obs if self._latest_raw_obs is not None else self._task_env.get_obs()
+        chunk_prefix_observations: list[dict[str, Any]] = []
+        chunk_suffix_observations: list[dict[str, Any]] = []
+        ee_convert_s = 0.0
+        take_action_s = 0.0
+        get_obs_s = 0.0
+        get_obs_from_take_action_s = 0.0
+        debug_compare_obs_s = 0.0
+        lerobot_s = 0.0
+        video_s = 0.0
+        convert_obs_s = 0.0
+        take_action_breakdown: dict[str, float] = {}
+        collect_obs_breakdown: dict[str, float] = {}
+        per_action_take_action_s: list[float] = []
+        per_action_get_obs_s: list[float] = []
+        per_action_get_obs_from_take_action_s: list[float] = []
+        per_action_debug_compare_obs_s: list[float] = []
+        per_action_lerobot_s: list[float] = []
+        per_action_video_s: list[float] = []
+        per_action_convert_obs_s: list[float] = []
         for action in action_chunk:
             if self._task_env.eval_success or self._task_env.take_action_cnt >= self._task_env.step_lim:
                 break
             pre_obs = current_raw_obs
             executed_action = np.asarray(action, dtype=np.float32)
             if self._control_mode == "ee_delta":
+                t0 = time.perf_counter()
                 raw_ee = extract_raw_ee_from_env_obs(pre_obs)
                 executed_action = ee_exec_action16_from_delta_action14(
                     left_pose7_now=raw_ee["left_pose7"],
@@ -797,11 +893,81 @@ class RoboTwinEnvSession:
                     right_grip_now=float(raw_ee["right_grip"]),
                     delta_action14=executed_action,
                 )
-                self._task_env.take_action(executed_action, action_type="ee")
+                ee_convert_s += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                returned_raw_obs = self._task_env.take_action(
+                    executed_action,
+                    action_type="ee",
+                    return_obs=self._use_take_action_obs,
+                )
+                dt = time.perf_counter() - t0
+                take_action_s += dt
+                per_action_take_action_s.append(dt)
+                action_timing = getattr(self._task_env, "last_take_action_timing", None)
+                if isinstance(action_timing, dict):
+                    for k, v in action_timing.items():
+                        if isinstance(v, (int, float, np.integer, np.floating)):
+                            take_action_breakdown[k] = take_action_breakdown.get(k, 0.0) + float(v)
             else:
-                self._task_env.take_action(executed_action)
-            current_raw_obs = self._task_env.get_obs()
+                t0 = time.perf_counter()
+                returned_raw_obs = self._task_env.take_action(
+                    executed_action,
+                    return_obs=self._use_take_action_obs,
+                )
+                dt = time.perf_counter() - t0
+                take_action_s += dt
+                per_action_take_action_s.append(dt)
+                action_timing = getattr(self._task_env, "last_take_action_timing", None)
+                if isinstance(action_timing, dict):
+                    for k, v in action_timing.items():
+                        if isinstance(v, (int, float, np.integer, np.floating)):
+                            take_action_breakdown[k] = take_action_breakdown.get(k, 0.0) + float(v)
+            if self._use_take_action_obs:
+                t0 = time.perf_counter()
+                current_raw_obs = returned_raw_obs
+                dt = time.perf_counter() - t0
+                get_obs_from_take_action_s += dt
+                per_action_get_obs_from_take_action_s.append(dt)
+                if current_raw_obs is None:
+                    raise RuntimeError("take_action(return_obs=True) returned None")
+                collect_timing = getattr(self._task_env, "last_collect_obs_timing", None)
+                if isinstance(collect_timing, dict):
+                    for k, v in collect_timing.items():
+                        if isinstance(v, (int, float, np.integer, np.floating)):
+                            collect_obs_breakdown[k] = collect_obs_breakdown.get(k, 0.0) + float(v)
+                if (
+                    self._debug_compare_obs_every > 0
+                    and self._debug_compare_obs_count % self._debug_compare_obs_every == 0
+                ):
+                    t0 = time.perf_counter()
+                    baseline_raw_obs = self._task_env.get_obs()
+                    compare_payload = _compare_raw_obs_summary(current_raw_obs, baseline_raw_obs)
+                    compare_payload.update(
+                        {
+                            "event": "env_take_action_obs_compare",
+                            "count": int(self._debug_compare_obs_count),
+                        }
+                    )
+                    if not self._timing_logger.disabled:
+                        self._timing_logger.info(json.dumps(compare_payload, ensure_ascii=True, sort_keys=True))
+                    current_raw_obs = baseline_raw_obs
+                    dt = time.perf_counter() - t0
+                    debug_compare_obs_s += dt
+                    per_action_debug_compare_obs_s.append(dt)
+                self._debug_compare_obs_count += 1
+            else:
+                t0 = time.perf_counter()
+                current_raw_obs = self._task_env.get_obs()
+                dt = time.perf_counter() - t0
+                get_obs_s += dt
+                per_action_get_obs_s.append(dt)
+                collect_timing = getattr(self._task_env, "last_collect_obs_timing", None)
+                if isinstance(collect_timing, dict):
+                    for k, v in collect_timing.items():
+                        if isinstance(v, (int, float, np.integer, np.floating)):
+                            collect_obs_breakdown[k] = collect_obs_breakdown.get(k, 0.0) + float(v)
             if self._lerobot_manager is not None and self._state is not None:
+                t0 = time.perf_counter()
                 state_vec = self._convert_observation(pre_obs)["state"]
                 self._lerobot_manager.add_step(
                     raw_obs=pre_obs,
@@ -809,7 +975,24 @@ class RoboTwinEnvSession:
                     task=self._state.prompt,
                     state_vec=np.asarray(state_vec, dtype=np.float32),
                 )
+                dt = time.perf_counter() - t0
+                lerobot_s += dt
+                per_action_lerobot_s.append(dt)
+            t0 = time.perf_counter()
             self._write_video_frame_from_obs(current_raw_obs)
+            dt = time.perf_counter() - t0
+            video_s += dt
+            per_action_video_s.append(dt)
+            t0 = time.perf_counter()
+            converted_obs = self._convert_observation(current_raw_obs)
+            dt = time.perf_counter() - t0
+            convert_obs_s += dt
+            per_action_convert_obs_s.append(dt)
+            if len(chunk_prefix_observations) < 3:
+                chunk_prefix_observations.append(converted_obs)
+            chunk_suffix_observations.append(converted_obs)
+            if len(chunk_suffix_observations) > 3:
+                chunk_suffix_observations.pop(0)
             consumed += 1
 
         done = bool(self._task_env.eval_success or self._task_env.take_action_cnt >= self._task_env.step_lim)
@@ -839,7 +1022,41 @@ class RoboTwinEnvSession:
             # non-terminal step penalty
             reward = -1.0
         self._latest_raw_obs = current_raw_obs
+        t0 = time.perf_counter()
         obs = self._convert_observation(current_raw_obs)
+        final_convert_s = time.perf_counter() - t0
+
+        if not self._timing_logger.disabled:
+            payload = {
+                "event": "env_step_chunk",
+                "total_s": time.perf_counter() - total_t0,
+                "consumed_actions": int(consumed),
+                "ee_convert_s": ee_convert_s,
+                "take_action_s": take_action_s,
+                "get_obs_s": get_obs_s,
+                "get_obs_from_take_action_s": get_obs_from_take_action_s,
+                "debug_compare_obs_s": debug_compare_obs_s,
+                "lerobot_s": lerobot_s,
+                "video_s": video_s,
+                "convert_obs_s": convert_obs_s,
+                "final_convert_s": final_convert_s,
+                "done": bool(done),
+                "use_take_action_obs": bool(self._use_take_action_obs),
+            }
+            payload.update(_summary_stats(per_action_take_action_s, "per_action_take_action"))
+            payload.update(_summary_stats(per_action_get_obs_s, "per_action_get_obs"))
+            payload.update(_summary_stats(per_action_get_obs_from_take_action_s, "per_action_get_obs_from_take_action"))
+            payload.update(_summary_stats(per_action_debug_compare_obs_s, "per_action_debug_compare_obs"))
+            payload.update(_summary_stats(per_action_lerobot_s, "per_action_lerobot"))
+            payload.update(_summary_stats(per_action_video_s, "per_action_video"))
+            payload.update(_summary_stats(per_action_convert_obs_s, "per_action_convert_obs"))
+            for k, v in sorted(take_action_breakdown.items()):
+                payload[f"take_action_breakdown_{k}"] = float(v)
+            for k, v in sorted(collect_obs_breakdown.items()):
+                payload[f"collect_obs_breakdown_{k}"] = float(v)
+            self._timing_logger.info(
+                json.dumps(payload, ensure_ascii=True, sort_keys=True)
+            )
 
         return {
             "observation": obs,
@@ -854,6 +1071,8 @@ class RoboTwinEnvSession:
                 "step_lim": int(self._task_env.step_lim),
                 "eval_success": bool(self._task_env.eval_success),
                 "plan_success": bool(getattr(self._task_env, "plan_success", True)),
+                "chunk_prefix_observations": chunk_prefix_observations,
+                "chunk_suffix_observations": chunk_suffix_observations,
             },
         }
 
@@ -880,6 +1099,7 @@ class RoboTwinWebsocketEnvServer:
 
     async def _handler(self, websocket: ws_server.ServerConnection) -> None:
         log = logging.getLogger("robotwin_env_ws")
+        timing_logger = logging.getLogger(ENV_TIMING_LOGGER_NAME)
         packer = msgpack_numpy.Packer()
         await websocket.send(packer.pack({"server": "robotwin_env_ws", "task_name": self._session.task_name}))
         log.info("client connected: %s", websocket.remote_address)
@@ -894,13 +1114,34 @@ class RoboTwinWebsocketEnvServer:
                 if cmd == "reset":
                     resp = self._session.reset(msg)
                 elif cmd == "step":
+                    t0 = time.perf_counter()
                     resp = self._session.step(msg)
+                    session_step_s = time.perf_counter() - t0
                 elif cmd == "finalize_collection_round":
                     resp = self._session.finalize_collection_round()
                 else:
                     raise ValueError(f"Unknown cmd: {cmd}")
 
-                await websocket.send(packer.pack(resp))
+                pack_t0 = time.perf_counter()
+                packed = packer.pack(resp)
+                pack_s = time.perf_counter() - pack_t0
+                send_t0 = time.perf_counter()
+                await websocket.send(packed)
+                send_s = time.perf_counter() - send_t0
+                if cmd == "step" and not timing_logger.disabled:
+                    timing_logger.info(
+                        json.dumps(
+                            {
+                                "event": "env_ws_step_roundtrip",
+                                "session_step_s": session_step_s,
+                                "pack_s": pack_s,
+                                "send_s": send_s,
+                                "packed_bytes": int(len(packed)),
+                            },
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        )
+                    )
             except websockets.ConnectionClosed:
                 log.info("client disconnected: %s", websocket.remote_address)
                 break
@@ -955,6 +1196,19 @@ def _parse_args() -> argparse.Namespace:
         help="Resize exported LeRobot images to 640x480 before writing (default: enabled).",
     )
     parser.add_argument("--seed_start", type=int, default=100000)
+    parser.add_argument(
+        "--use_take_action_obs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse observation returned by take_action instead of calling get_obs() again (default: enabled).",
+    )
+    parser.add_argument(
+        "--debug_compare_obs_every",
+        type=int,
+        default=0,
+        help="If >0, periodically compare take_action(return_obs=True) against a fresh get_obs() baseline.",
+    )
+    parser.add_argument("--timing_log_file", type=str, default=None)
     return parser.parse_args()
 
 
@@ -989,6 +1243,9 @@ def main() -> None:
         lerobot_resize_to_640x480=args.lerobot_resize_to_640x480,
         seed_start=args.seed_start,
         control_mode=args.control_mode,
+        use_take_action_obs=args.use_take_action_obs,
+        debug_compare_obs_every=args.debug_compare_obs_every,
+        timing_log_file=args.timing_log_file,
     )
 
     server = RoboTwinWebsocketEnvServer(

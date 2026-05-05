@@ -45,6 +45,7 @@ class KeyframeExplorationConfig:
     network_checkpoint: str | None = None
     network_obs_dim: int = 32
     network_latent_dim: int = 16
+    sigma_noise_dct_k: int = 4
 
 
 class DCTNoiseFn(Protocol):
@@ -260,7 +261,7 @@ def load_action_perturb_net(path: str | pathlib.Path) -> DirectionRadiusActionPe
 
 
 class DimwiseDiagGaussianDCTPerturbNet:
-    """Per-action-dimension diagonal Gaussian perturbation net in DCT space."""
+    """Diagonal Gaussian sigma net on a selected low-frequency/action-dim DCT block."""
 
     def __init__(
         self,
@@ -302,7 +303,6 @@ class DimwiseDiagGaussianDCTPerturbNet:
         self.sigma_max = float(sigma_max)
         self.action_noise_dims = tuple(int(x) for x in action_noise_dims) if action_noise_dims is not None else None
         self.noise_dct_keep_k = int(noise_dct_keep_k) if int(noise_dct_keep_k) > 0 else int(chunk_size)
-        self._dct_mat = _build_ortho_dct_matrix(self.chunk_size)
 
     @classmethod
     def load(cls, path: str | pathlib.Path) -> "DimwiseDiagGaussianDCTPerturbNet":
@@ -369,6 +369,9 @@ class DimwiseDiagGaussianDCTPerturbNet:
                 out.append(i)
         return sorted(set(out))
 
+    def _effective_keep_k(self) -> int:
+        return min(int(self.noise_dct_keep_k), int(self.chunk_size))
+
     def sample_delta_dct(
         self,
         *,
@@ -381,23 +384,23 @@ class DimwiseDiagGaussianDCTPerturbNet:
         t, a = coeffs.shape
         if t != self.chunk_size or a != self.action_dim:
             raise ValueError(f"DCT shape mismatch for sigma net. Got {(t, a)}, expect {(self.chunk_size, self.action_dim)}")
+        keep_k = self._effective_keep_k()
         delta = np.zeros_like(coeffs, dtype=np.float32)
         allowed_dims = self._allowed_dims(a, action_noise_dims)
-        for dim_idx in allowed_dims:
-            dim_onehot = np.zeros((self.action_dim,), dtype=np.float32)
-            dim_onehot[int(dim_idx)] = 1.0
-            x = np.concatenate([coeffs[:, int(dim_idx)], dim_onehot], axis=0)
-            sigma = self._sigma_from_logits(self._mlp(x))
-            if self.noise_dct_keep_k < self.chunk_size:
-                sigma = sigma.copy()
-                sigma[self.noise_dct_keep_k :] = 0.0
-            eps = np.random.normal(0.0, 1.0, size=(self.chunk_size,)).astype(np.float32)
-            delta[:, int(dim_idx)] = sigma * eps
+        if not allowed_dims or keep_k <= 0:
+            return delta
+
+        block = coeffs[:keep_k, allowed_dims]
+        x = block.reshape(-1)
+        sigma = self._sigma_from_logits(self._mlp(x)).reshape(keep_k, len(allowed_dims))
+        eps = np.random.normal(0.0, 1.0, size=sigma.shape).astype(np.float32)
+        delta[:keep_k, allowed_dims] = sigma * eps
 
         if self.action_delta_limit > 0:
-            delta_action = self._dct_mat.T @ (delta / max(self.dct_scale, 1e-6))
+            dct_mat = _build_ortho_dct_matrix(self.chunk_size)
+            delta_action = dct_mat.T @ (delta / max(self.dct_scale, 1e-6))
             delta_action = np.clip(delta_action, -float(self.action_delta_limit), float(self.action_delta_limit))
-            delta = (self._dct_mat @ delta_action * float(self.dct_scale)).astype(np.float32)
+            delta = (dct_mat @ delta_action * float(self.dct_scale)).astype(np.float32)
         return np.asarray(delta, dtype=np.float32)
 
 

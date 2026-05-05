@@ -39,9 +39,36 @@ class ValueWebsocketClient:
         resp = self._request({"cmd": "predict", "observation": transformed_obs})
         return float(resp["value"])
 
+    def predict_phase_value(self, obs: dict[str, Any], phase_class: int) -> float:
+        resp = self._request(
+            {
+                "cmd": "predict_phase_value",
+                "observation": obs,
+                "phase_class": int(phase_class),
+            }
+        )
+        return float(resp["value"])
+
+    def predict_phase_value_batch(self, obs_batch: list[dict[str, Any]], phase_class: int) -> list[float]:
+        resp = self._request(
+            {
+                "cmd": "predict_phase_value_batch",
+                "observations": list(obs_batch),
+                "phase_class": int(phase_class),
+            }
+        )
+        values = resp.get("values", [])
+        if not isinstance(values, list):
+            raise TypeError(f"Unexpected batch value response type: {type(values)}")
+        return [float(v) for v in values]
+
     def predict_keyframe(self, transformed_obs: dict[str, Any]) -> float:
         resp = self._request({"cmd": "predict_keyframe", "observation": transformed_obs})
         return float(resp["keyframe_prob"])
+
+    def predict_keyframe_class(self, transformed_obs: dict[str, Any]) -> int:
+        resp = self._request({"cmd": "predict_keyframe_class", "observation": transformed_obs})
+        return int(resp["phase_class"])
 
     def sync_params_from_file(self, params_file: str) -> None:
         self._request({"cmd": "sync_params_from_file", "params_file": params_file})

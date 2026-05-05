@@ -69,8 +69,7 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --rollout_batch_size 1024 \
   --mini_batch_size 32 \
   --explore_mode never \
-  --ppo_epochs 0 \
-  --value_epochs 0
+  --ppo_epochs 0
 ```
 
 Output example:
@@ -255,14 +254,14 @@ uv run python scripts/trigger_keyframe_train_ws.py \
   --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json
 ```
 
-Value only, whole-episode target:
+<!-- Value only, whole-episode target:
 
 ```bash
 uv run python scripts/trigger_value_mc_train_ws.py \
   --ws_url ws://127.0.0.1:8877 \
   --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
   --repo_id lerobot_ppo_corpus
-```
+``` -->
 
 Optional phase-conditioned value training:
 
@@ -418,9 +417,9 @@ uv run python scripts/fit_dimwise_sigma_net_lerobot.py \
   --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
   --out checkpoints/explored_net/dimwise_sigma_dct.pkl \
   --chunk_size 32 \
-  --action_noise_dims "0,1,2,3,4,5,6" \
+  --action_noise_dims "0,1,2,3,4,5" \
   --action_delta_limit 0.1 \
-  --noise_dct_keep_k 4
+  --noise_dct_keep_k 4 \
   --epochs 100 \
   --batch_size 128
 ```
@@ -440,7 +439,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/analyze_dimwise_sigma_net_lerob
   --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
   --net checkpoints/explored_net/dimwise_sigma_dct.pkl \
   --chunk_size 32 \
-  --action_noise_dims "0,1,2,3,4,5,6" \
+  --action_noise_dims "0,1,2,3,4,5" \
   --num_samples_per_chunk 64 \
   --out_json checkpoints/explored_net/dimwise_sigma_dct_analysis.json
 ```
@@ -459,8 +458,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/compare_sigma_rollout_videos.py
   --sigma_ckpt checkpoints/explored_net/dimwise_sigma_dct.pkl \
   --explore_mode conditional_keyframe \
   --explore_keyframe_threshold 0.5 \
-  --explore_keyframe_gate small_net \
-  --explore_action_noise_dims "0,1,2,3,4,5,6" \
+  --explore_action_noise_dims "0,1,2,3,4,5" \
   --out_json checkpoints/explored_net/compare_sigma_rollout_videos_ws8877.json
 ```
 
@@ -500,8 +498,7 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --explore_network_mix_alpha 0.5 \
   --explore_network_ckpt checkpoints/explored_net/explore_dir_radius_nll.pkl \
   --explore_network_obs_dim 32 \
-  --explore_network_latent_dim 16 \
-  --explore_keyframe_gate model_head
+  --explore_network_latent_dim 16
 ``` -->
 
 Using the dimwise sigma DCT perturbation network:
@@ -512,26 +509,28 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
   --env.ws_url ws://127.0.0.1:8765 \
   --total_updates 10 \
-  --rollout_batch_size 64 \
-  --mini_batch_size 32 \
+  --buffer_capacity 1024 \
+  --mini_batch_size 4 \
   --ppo_epochs 1 \
-  --value_epochs 0 \
   --value.ws_url ws://127.0.0.1:8877 \
   --explore_mode conditional_keyframe \
   --explore_keyframe_threshold 0.5 \
-  --explore_keyframe_gate small_net \
   --explore_perturb_backend dct_sigma_network \
   --explore_network_ckpt checkpoints/explored_net/dimwise_sigma_dct.pkl \
-  --explore_action_noise_dims "0,1,2,3,4,5,6"
+  --explore_action_noise_dims "0,1,2,3,4,5" \
+  --timing_log_file /tmp/pi05_ppo_timing.jsonl
 
 ```
 
 Notes for this sigma-net path:
 
-- `dct_sigma_network` is applied inside the row-wise rollout path.
-- With `--explore_mode conditional_keyframe`, sigma perturbation is only enabled when the predicted keyframe probability exceeds `--explore_keyframe_threshold`.
-- PPO value bootstrap is now disabled across phase switches. In practice, TD bootstrapping only happens when both the current and next frame are inside keyphases and their predicted phase classes are the same.
+- `dct_sigma_network` now runs on the standard full-chunk decode path.
+- PPO first decodes the full chunk, then perturbs the selected low-frequency DCT block, then recomputes logprobs on the executed tokens.
+- Phase and value are both served by `serve_value_mc_ws.py`. For one chunk, rollout fixes the phase to the chunk-start phase when querying the executed chunk's `next_value`.
+- With `--explore_mode conditional_keyframe`, sigma perturbation is only enabled when the websocket keyframe probability exceeds `--explore_keyframe_threshold`.
 - The checkpoint stores `action_delta_limit`, and the runtime sampler will still rescale a sampled chunk if any action-space perturbation exceeds that limit.
+- `--noise_dct_keep_k 4` means sigma is predicted only on the first 4 DCT rows.
+- `--explore_action_noise_dims "0,1,2,3,4,5,6"` means sigma is modeled only on those action dimensions.
 - Current recommended checkpoint path in this workflow is `dimwise_sigma_dct.pkl`.
 
 Convenience wrapper also exists:
@@ -545,7 +544,7 @@ bash scripts/run_pi0_fast_online_v2.sh \
 
 ## Practical Notes
 
-1. If you only want rollout data, set `--ppo_epochs 0 --value_epochs 0`.
+1. If you only want rollout data, set `--ppo_epochs 0`.
 2. Value and keyframe training logs appear in the `serve_value_mc_ws.py` terminal.
 3. The env server is responsible for correct `ee_delta` execution and online LeRobot export.
 4. The PPO policy script now supports `--policy.config auto`, but being explicit is still clearer in important runs.
