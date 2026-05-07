@@ -60,6 +60,14 @@ class PhaseTrainSample:
     target: float
 
 
+@dataclasses.dataclass(frozen=True)
+class SubtaskTrainSample:
+    ds_index: int
+    subtask_name: str
+    subtask_prompt: str
+    target: float
+
+
 def _collate_tree(items):
     return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
 
@@ -180,6 +188,13 @@ def _normalize_phase_name(raw: Any) -> str:
     return name
 
 
+def _normalize_subtask_name(raw: Any) -> str:
+    name = str(raw).strip()
+    if not name:
+        raise ValueError("Subtask name must be non-empty.")
+    return name
+
+
 def _parse_keyphase_frame_range(raw: Any) -> tuple[int, int]:
     if isinstance(raw, str):
         text = raw.strip()
@@ -212,8 +227,12 @@ def _parse_keyphase_annotations(path: str | pathlib.Path) -> dict[int, list[KeyP
                 raise ValueError(f"Episode {ep} keyphase item must be an object, got {type(item).__name__}.")
             name = _normalize_phase_name(item.get("name", ""))
             if "start" in item or "end" in item:
-                start = int(item.get("start"))
-                end = int(item.get("end"))
+                start_raw = item.get("start")
+                end_raw = item.get("end")
+                if start_raw is None or end_raw is None:
+                    continue
+                start = int(start_raw)
+                end = int(end_raw)
             elif "frame" in item:
                 start, end = _parse_keyphase_frame_range(item["frame"])
             elif "frames" in item:
@@ -260,6 +279,79 @@ def _load_keyphase_phase_names(path: str | pathlib.Path) -> list[str]:
             f"but KEYFRAME_NUM_BINS={KEYFRAME_NUM_BINS}."
         )
     return phase_names
+
+
+def _parse_subtask_annotations(path: str | pathlib.Path) -> dict[int, list[KeyPhaseSpan]]:
+    raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    episodes_raw = raw.get("episodes", {})
+    if not isinstance(episodes_raw, dict):
+        raise ValueError("Subtask annotations json must contain an `episodes` object.")
+
+    parsed: dict[int, list[KeyPhaseSpan]] = {}
+    for ep_key, spans_raw in episodes_raw.items():
+        ep = int(ep_key)
+        if spans_raw is None:
+            raise ValueError(f"Episode {ep} subtask annotations must not be null.")
+        if not isinstance(spans_raw, list):
+            raise ValueError(f"Episode {ep} subtasks must be a list.")
+        spans: list[KeyPhaseSpan] = []
+        for item in spans_raw:
+            if not isinstance(item, dict):
+                raise ValueError(f"Episode {ep} subtask item must be an object, got {type(item).__name__}.")
+            name = _normalize_subtask_name(item.get("name", ""))
+            start_raw = item.get("start")
+            end_raw = item.get("end")
+            if start_raw is None or end_raw is None:
+                raise ValueError(f"Episode {ep} subtask `{name}` missing start/end.")
+            start = int(start_raw)
+            end = int(end_raw)
+            if start < 0 or end < 0 or end < start:
+                raise ValueError(f"Episode {ep} subtask `{name}` has invalid range [{start}, {end}].")
+            spans.append(KeyPhaseSpan(name=name, start=start, end=end))
+        spans.sort(key=lambda span: (span.start, span.end, span.name))
+        prev_end = -1
+        for span in spans:
+            if span.start <= prev_end:
+                raise ValueError(
+                    f"Episode {ep} subtask spans overlap: start={span.start} previous_end={prev_end}."
+                )
+            prev_end = span.end
+        parsed[ep] = spans
+    return parsed
+
+
+def _load_subtask_names(path: str | pathlib.Path) -> list[str]:
+    raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    names_raw = raw.get("subtask_names", None)
+    if names_raw is not None:
+        if not isinstance(names_raw, list):
+            raise ValueError("Subtask annotations `subtask_names` must be a list when provided.")
+        names = [_normalize_subtask_name(x) for x in names_raw]
+    else:
+        ann_eps = _parse_subtask_annotations(path)
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for ep in sorted(ann_eps.keys()):
+            for span in ann_eps[ep]:
+                if span.name not in seen_set:
+                    seen.append(span.name)
+                    seen_set.add(span.name)
+        names = seen
+    if not names:
+        raise ValueError("Subtask annotations contain no subtask names.")
+    if len(names) + 1 > KEYFRAME_NUM_BINS:
+        raise ValueError(
+            f"Need {len(names) + 1} subtask classes (including `none`), but KEYFRAME_NUM_BINS={KEYFRAME_NUM_BINS}."
+        )
+    return names
+
+
+def _compose_subtask_prompt(task_prompt: str, subtask_name: str) -> str:
+    task_text = str(task_prompt).strip()
+    subtask_text = _normalize_subtask_name(subtask_name)
+    if task_text:
+        return f"task: {task_text}; current subtask: {subtask_text}"
+    return f"current subtask: {subtask_text}"
 
 
 def _compose_phase_prompt(task_prompt: str, phase_name: str) -> str:
@@ -312,7 +404,9 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
             use_value_head=True,
             use_keyframe_head=True,
+            use_subtask_head=True,
             keyframe_num_bins=KEYFRAME_NUM_BINS,
+            subtask_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     if isinstance(cfg.model, _base_pi0.Pi0Config):
@@ -328,7 +422,9 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             discrete_state_input=base.discrete_state_input,
             use_value_head=True,
             use_keyframe_head=True,
+            use_subtask_head=True,
             keyframe_num_bins=KEYFRAME_NUM_BINS,
+            subtask_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     raise TypeError(f"Config `{cfg.name}` is not a supported Pi0FAST/Pi0/Pi05 config.")
@@ -418,6 +514,55 @@ class _LerobotKeyframeDataset(torch.utils.data.Dataset):
         }
 
 
+class _LerobotSubtaskDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        base_ds: Any,
+        input_transform: _transforms.DataTransformFn,
+        *,
+        ann_eps: dict[int, list[KeyPhaseSpan]],
+        subtask_to_class: dict[str, int],
+        ds_indices: np.ndarray | None = None,
+        prompt_overrides: list[str] | None = None,
+    ) -> None:
+        self._base_ds = base_ds
+        self._input_transform = input_transform
+        self._ann_eps = ann_eps
+        self._subtask_to_class = dict(subtask_to_class)
+        self._ds_indices = (
+            np.asarray(ds_indices, dtype=np.int32)
+            if ds_indices is not None
+            else np.arange(len(base_ds), dtype=np.int32)
+        )
+        self._prompt_overrides = list(prompt_overrides) if prompt_overrides is not None else None
+        if self._prompt_overrides is not None and len(self._prompt_overrides) != self._ds_indices.shape[0]:
+            raise ValueError("ds_indices and prompt_overrides length mismatch.")
+
+    def __len__(self) -> int:
+        return int(self._ds_indices.shape[0])
+
+    def _subtask_class_label(self, frame_idx: int, subtasks: list[KeyPhaseSpan]) -> int:
+        fi = int(frame_idx)
+        for subtask in subtasks:
+            if int(subtask.start) <= fi <= int(subtask.end):
+                return int(self._subtask_to_class[str(subtask.name)])
+        return 0
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        ds_idx = int(self._ds_indices[int(idx)])
+        item = self._base_ds[ds_idx]
+        row = {k: item[k] for k in item.keys()}
+        ep = int(np.asarray(row["episode_index"]).item())
+        fi = int(np.asarray(row["frame_index"]).item())
+        label = self._subtask_class_label(fi, self._ann_eps.get(ep, []))
+        prompt_override = None if self._prompt_overrides is None else self._prompt_overrides[int(idx)]
+        obs = _row_to_transformed_obs(row, self._input_transform, prompt_override=prompt_override)
+        return {
+            "obs": obs,
+            "target": np.asarray(label, dtype=np.int32),
+        }
+
+
 class ValueMCService:
     def __init__(
         self,
@@ -456,10 +601,12 @@ class ValueMCService:
         # Freeze backbone; train only lightweight aux input + task heads.
         self._value_filter = nnx.All(nnx.Param, nnx_utils.PathRegex(".*(value_head|aux_cls_embed).*"))
         self._keyframe_filter = nnx.All(nnx.Param, nnx_utils.PathRegex(".*(keyframe_head|aux_cls_embed).*"))
+        self._subtask_filter = nnx.All(nnx.Param, nnx_utils.PathRegex(".*(subtask_head|aux_cls_embed).*"))
         self._tx = cfg.optimizer.create(cfg.lr_schedule.create(), weight_decay_mask=None)
         model_state = nnx.state(self._model)
         self._value_opt_state = self._tx.init(model_state.filter(self._value_filter))
         self._keyframe_opt_state = self._tx.init(model_state.filter(self._keyframe_filter))
+        self._subtask_opt_state = self._tx.init(model_state.filter(self._subtask_filter))
         self._live_input_transform = _build_input_transform(
             self._train_config,
             tasks=None,
@@ -469,6 +616,8 @@ class ValueMCService:
         )
         self._phase_to_class: dict[str, int] = {}
         self._class_to_phase: dict[int, str] = {}
+        self._subtask_to_class: dict[str, int] = {}
+        self._class_to_subtask: dict[int, str] = {}
         self._mc_epochs = max(1, int(mc_epochs))
         self._mc_batch_size = max(1, int(mc_batch_size))
         self._mc_gamma = float(mc_gamma)
@@ -502,9 +651,139 @@ class ValueMCService:
             model = nnx.merge(self._compiled_model_def, state)
             return model.predict_keyframe_class(observation, stop_gradient=True)
 
+        def _predict_subtask_class_fn(state: nnx.State, observation: _model.Observation) -> jax.Array:
+            model = nnx.merge(self._compiled_model_def, state)
+            return model.predict_subtask_class(observation, stop_gradient=True)
+
         self._predict_value_jit = jax.jit(_predict_value_fn)
         self._predict_keyframe_prob_jit = jax.jit(_predict_keyframe_prob_fn)
         self._predict_keyframe_class_jit = jax.jit(_predict_keyframe_class_fn)
+        self._predict_subtask_class_jit = jax.jit(_predict_subtask_class_fn)
+        self._init_stateful_compiled_trainers()
+
+    def _init_stateful_compiled_trainers(self) -> None:
+        diff_value_state = nnx.DiffState(0, self._value_filter)
+        diff_keyframe_state = nnx.DiffState(0, self._keyframe_filter)
+        diff_subtask_state = nnx.DiffState(0, self._subtask_filter)
+
+        def _train_value_step_fn(
+            state: nnx.State,
+            value_opt_state: Any,
+            obs_batch: dict[str, jnp.ndarray],
+            targets: jnp.ndarray,
+        ) -> tuple[nnx.State, Any, dict[str, jax.Array]]:
+            model = nnx.merge(self._compiled_model_def, state)
+
+            def loss_fn(m):
+                observation = _model.Observation.from_dict(obs_batch)
+                logits = m.predict_value_logits(observation, stop_gradient=False)
+                soft_target = m.project_values_to_bins(targets)
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                per_sample_loss = -jnp.sum(soft_target * log_probs, axis=-1)
+                value_loss = jnp.mean(per_sample_loss)
+                centers = m.value_bin_centers()
+                probs = jax.nn.softmax(logits, axis=-1)
+                pred_value = jnp.sum(probs * centers[None, :], axis=-1)
+                value_mae = jnp.mean(jnp.abs(pred_value - targets))
+                return value_loss, {"value_loss": value_loss, "value_mae": value_mae}
+
+            (_, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_value_state, has_aux=True)(model)
+            params = nnx.state(model).filter(self._value_filter)
+            updates, new_value_opt_state = self._tx.update(grads, value_opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            nnx.update(model, new_params)
+            new_state = nnx.state(model)
+            metrics = {
+                **metrics,
+                "value_grad_norm": optax.global_norm(grads),
+            }
+            return new_state, new_value_opt_state, metrics
+
+        def _train_keyframe_step_fn(
+            state: nnx.State,
+            keyframe_opt_state: Any,
+            obs_batch: dict[str, jnp.ndarray],
+            labels: jnp.ndarray,
+        ) -> tuple[nnx.State, Any, dict[str, jax.Array]]:
+            model = nnx.merge(self._compiled_model_def, state)
+
+            def loss_fn(m):
+                observation = _model.Observation.from_dict(obs_batch)
+                logits = m.predict_keyframe_logits(observation, stop_gradient=False)
+                labels_i = jnp.clip(labels.astype(jnp.int32), 0, logits.shape[-1] - 1)
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                per_sample_loss = -log_probs[jnp.arange(logits.shape[0]), labels_i]
+                keyframe_loss = jnp.mean(per_sample_loss)
+                probs = jax.nn.softmax(logits, axis=-1)
+                pred_score = jnp.sum(probs[:, 1:], axis=-1)
+                target_score = (labels_i > 0).astype(jnp.float32)
+                pred = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                acc = jnp.mean((pred == labels_i).astype(jnp.float32))
+                prob_mae = jnp.mean(jnp.abs(pred_score - target_score))
+                prob_mse = jnp.mean(jnp.square(pred_score - target_score))
+                return keyframe_loss, {
+                    "keyframe_loss": keyframe_loss,
+                    "keyframe_prob_mae": prob_mae,
+                    "keyframe_mse": prob_mse,
+                    "keyframe_acc": acc,
+                }
+
+            (_, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_keyframe_state, has_aux=True)(model)
+            params = nnx.state(model).filter(self._keyframe_filter)
+            updates, new_keyframe_opt_state = self._tx.update(grads, keyframe_opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            nnx.update(model, new_params)
+            new_state = nnx.state(model)
+            metrics = {
+                **metrics,
+                "keyframe_grad_norm": optax.global_norm(grads),
+            }
+            return new_state, new_keyframe_opt_state, metrics
+
+        def _train_subtask_step_fn(
+            state: nnx.State,
+            subtask_opt_state: Any,
+            obs_batch: dict[str, jnp.ndarray],
+            labels: jnp.ndarray,
+        ) -> tuple[nnx.State, Any, dict[str, jax.Array]]:
+            model = nnx.merge(self._compiled_model_def, state)
+
+            def loss_fn(m):
+                observation = _model.Observation.from_dict(obs_batch)
+                logits = m.predict_subtask_logits(observation, stop_gradient=False)
+                labels_i = jnp.clip(labels.astype(jnp.int32), 0, logits.shape[-1] - 1)
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                per_sample_loss = -log_probs[jnp.arange(logits.shape[0]), labels_i]
+                subtask_loss = jnp.mean(per_sample_loss)
+                pred = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                acc = jnp.mean((pred == labels_i).astype(jnp.float32))
+                probs = jax.nn.softmax(logits, axis=-1)
+                pred_score = jnp.sum(probs[:, 1:], axis=-1)
+                target_score = (labels_i > 0).astype(jnp.float32)
+                prob_mae = jnp.mean(jnp.abs(pred_score - target_score))
+                prob_mse = jnp.mean(jnp.square(pred_score - target_score))
+                return subtask_loss, {
+                    "subtask_loss": subtask_loss,
+                    "subtask_prob_mae": prob_mae,
+                    "subtask_mse": prob_mse,
+                    "subtask_acc": acc,
+                }
+
+            (_, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_subtask_state, has_aux=True)(model)
+            params = nnx.state(model).filter(self._subtask_filter)
+            updates, new_subtask_opt_state = self._tx.update(grads, subtask_opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            nnx.update(model, new_params)
+            new_state = nnx.state(model)
+            metrics = {
+                **metrics,
+                "subtask_grad_norm": optax.global_norm(grads),
+            }
+            return new_state, new_subtask_opt_state, metrics
+
+        self._train_value_step_jit = jax.jit(_train_value_step_fn)
+        self._train_keyframe_step_jit = jax.jit(_train_keyframe_step_fn)
+        self._train_subtask_step_jit = jax.jit(_train_subtask_step_fn)
 
     @staticmethod
     def _resolve_success_bool(value: Any) -> bool:
@@ -593,6 +872,37 @@ class ValueMCService:
             )
         return value
 
+    def predict_subtask_value(self, obs: dict[str, Any], subtask_class: int) -> float:
+        total_t0 = time.perf_counter()
+        prompt_override = None
+        subtask_idx = int(subtask_class)
+        if subtask_idx > 0:
+            subtask_name = self._class_to_subtask.get(subtask_idx)
+            if subtask_name:
+                base_prompt = str(obs.get("prompt", "")).strip()
+                prompt_override = _compose_subtask_prompt(base_prompt, subtask_name)
+        transform_t0 = time.perf_counter()
+        transformed_obs = self._transform_live_observation(obs, prompt_override=prompt_override)
+        transform_s = time.perf_counter() - transform_t0
+        forward_t0 = time.perf_counter()
+        value = self.predict(transformed_obs)
+        forward_s = time.perf_counter() - forward_t0
+        if not timing_log.disabled:
+            timing_log.info(
+                json.dumps(
+                    {
+                        "event": "predict_subtask_value",
+                        "subtask_class": int(subtask_class),
+                        "transform_s": transform_s,
+                        "forward_s": forward_s,
+                        "total_s": time.perf_counter() - total_t0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+        return value
+
     def predict_phase_value_batch(self, obs_batch: list[dict[str, Any]], phase_class: int) -> list[float]:
         total_t0 = time.perf_counter()
         if not obs_batch:
@@ -623,6 +933,47 @@ class ValueMCService:
                     {
                         "event": "predict_phase_value_batch",
                         "phase_class": int(phase_class),
+                        "batch_size": int(len(obs_batch)),
+                        "transform_s": transform_s,
+                        "forward_s": forward_s,
+                        "total_s": time.perf_counter() - total_t0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+        return values
+
+    def predict_subtask_value_batch(self, obs_batch: list[dict[str, Any]], subtask_class: int) -> list[float]:
+        total_t0 = time.perf_counter()
+        if not obs_batch:
+            return []
+        prompt_override = None
+        subtask_idx = int(subtask_class)
+        if subtask_idx > 0:
+            subtask_name = self._class_to_subtask.get(subtask_idx)
+            if subtask_name:
+                prompt_override = subtask_name
+        transformed_batch: list[dict[str, Any]] = []
+        transform_t0 = time.perf_counter()
+        for obs in obs_batch:
+            per_prompt_override = None
+            if prompt_override is not None:
+                base_prompt = str(obs.get("prompt", "")).strip()
+                per_prompt_override = _compose_subtask_prompt(base_prompt, prompt_override)
+            transformed_batch.append(
+                self._transform_live_observation(obs, prompt_override=per_prompt_override)
+            )
+        transform_s = time.perf_counter() - transform_t0
+        forward_t0 = time.perf_counter()
+        values = self.predict_batch(transformed_batch)
+        forward_s = time.perf_counter() - forward_t0
+        if not timing_log.disabled:
+            timing_log.info(
+                json.dumps(
+                    {
+                        "event": "predict_subtask_value_batch",
+                        "subtask_class": int(subtask_class),
                         "batch_size": int(len(obs_batch)),
                         "transform_s": transform_s,
                         "forward_s": forward_s,
@@ -684,6 +1035,31 @@ class ValueMCService:
             )
         return out
 
+    def predict_subtask_class(self, transformed_obs: dict[str, Any]) -> int:
+        total_t0 = time.perf_counter()
+        observation = _model.Observation.from_dict(
+            jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], transformed_obs)
+        )
+        build_obs_s = time.perf_counter() - total_t0
+        forward_t0 = time.perf_counter()
+        klass = self._predict_subtask_class_jit(self._compiled_model_state, observation)[0]
+        forward_s = time.perf_counter() - forward_t0
+        out = int(np.asarray(klass))
+        if not timing_log.disabled:
+            timing_log.info(
+                json.dumps(
+                    {
+                        "event": "predict_subtask_class",
+                        "build_obs_s": build_obs_s,
+                        "forward_s": forward_s,
+                        "total_s": time.perf_counter() - total_t0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+        return out
+
     def sync_params_from_file(self, params_file: str) -> None:
         path = pathlib.Path(params_file)
         with path.open("rb") as f:
@@ -708,10 +1084,13 @@ class ValueMCService:
             "params_pure": nnx.state(self._model).to_pure_dict(),
             "phase_to_class": dict(self._phase_to_class),
             "class_to_phase": dict(self._class_to_phase),
+            "subtask_to_class": dict(self._subtask_to_class),
+            "class_to_subtask": dict(self._class_to_subtask),
         }
         if include_optimizer_state:
             payload["value_opt_state"] = self._value_opt_state
             payload["keyframe_opt_state"] = self._keyframe_opt_state
+            payload["subtask_opt_state"] = self._subtask_opt_state
         self._dump_pickle_atomic(out, payload)
         log.info("saved value/keyframe state: %s", out)
         return str(out)
@@ -725,15 +1104,21 @@ class ValueMCService:
             pure = payload["params_pure"]
             value_opt_state = payload.get("value_opt_state")
             keyframe_opt_state = payload.get("keyframe_opt_state")
+            subtask_opt_state = payload.get("subtask_opt_state")
             phase_to_class = payload.get("phase_to_class")
             class_to_phase = payload.get("class_to_phase")
+            subtask_to_class = payload.get("subtask_to_class")
+            class_to_subtask = payload.get("class_to_subtask")
         else:
             # Backward-compatible: raw pure params dict.
             pure = payload
             value_opt_state = None
             keyframe_opt_state = None
+            subtask_opt_state = None
             phase_to_class = None
             class_to_phase = None
+            subtask_to_class = None
+            class_to_subtask = None
 
         state = nnx.state(self._model)
         state.replace_by_pure_dict(pure)
@@ -745,10 +1130,16 @@ class ValueMCService:
                 self._value_opt_state = value_opt_state
             if keyframe_opt_state is not None:
                 self._keyframe_opt_state = keyframe_opt_state
+            if subtask_opt_state is not None:
+                self._subtask_opt_state = subtask_opt_state
         if isinstance(phase_to_class, dict):
             self._phase_to_class = {str(k): int(v) for k, v in phase_to_class.items()}
         if isinstance(class_to_phase, dict):
             self._class_to_phase = {int(k): str(v) for k, v in class_to_phase.items()}
+        if isinstance(subtask_to_class, dict):
+            self._subtask_to_class = {str(k): int(v) for k, v in subtask_to_class.items()}
+        if isinstance(class_to_subtask, dict):
+            self._class_to_subtask = {int(k): str(v) for k, v in class_to_subtask.items()}
         log.info("loaded value/keyframe state: %s", path)
 
     def _autosave_after_train(self, stage: str) -> str | None:
@@ -782,6 +1173,11 @@ class ValueMCService:
             "keyframe_mse",
             "keyframe_acc",
             "keyframe_grad_norm",
+            "subtask_loss",
+            "subtask_prob_mae",
+            "subtask_mse",
+            "subtask_acc",
+            "subtask_grad_norm",
             "value_loss",
             "value_mae",
             "value_grad_norm",
@@ -801,69 +1197,33 @@ class ValueMCService:
         )
 
     def _train_one_batch(self, obs_batch: dict[str, jnp.ndarray], targets: jnp.ndarray) -> dict[str, float]:
-        model = self._model
-
-        def loss_fn(m):
-            observation = _model.Observation.from_dict(obs_batch)
-            logits = m.predict_value_logits(observation, stop_gradient=False)
-            soft_target = m.project_values_to_bins(targets)
-            log_probs = jax.nn.log_softmax(logits, axis=-1)
-            per_sample_loss = -jnp.sum(soft_target * log_probs, axis=-1)
-            value_loss = jnp.mean(per_sample_loss)
-            centers = m.value_bin_centers()
-            probs = jax.nn.softmax(logits, axis=-1)
-            pred_value = jnp.sum(probs * centers[None, :], axis=-1)
-            value_mae = jnp.mean(jnp.abs(pred_value - targets))
-            return value_loss, {"value_loss": value_loss, "value_mae": value_mae}
-
-        diff_state = nnx.DiffState(0, self._value_filter)
-        (_, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model)
-        params = nnx.state(model).filter(self._value_filter)
-        updates, self._value_opt_state = self._tx.update(grads, self._value_opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        nnx.update(model, new_params)
-        self._sync_compiled_state_from_model()
-        metrics = {
-            **metrics,
-            "value_grad_norm": optax.global_norm(grads),
-        }
+        self._compiled_model_state, self._value_opt_state, metrics = self._train_value_step_jit(
+            self._compiled_model_state,
+            self._value_opt_state,
+            obs_batch,
+            targets,
+        )
+        nnx.update(self._model, self._compiled_model_state)
         return self._as_float_metrics(metrics)
 
     def _train_one_keyframe_batch(self, obs_batch: dict[str, jnp.ndarray], labels: jnp.ndarray) -> dict[str, float]:
-        model = self._model
+        self._compiled_model_state, self._keyframe_opt_state, metrics = self._train_keyframe_step_jit(
+            self._compiled_model_state,
+            self._keyframe_opt_state,
+            obs_batch,
+            labels,
+        )
+        nnx.update(self._model, self._compiled_model_state)
+        return self._as_float_metrics(metrics)
 
-        def loss_fn(m):
-            observation = _model.Observation.from_dict(obs_batch)
-            logits = m.predict_keyframe_logits(observation, stop_gradient=False)
-            labels_i = jnp.clip(labels.astype(jnp.int32), 0, logits.shape[-1] - 1)
-            log_probs = jax.nn.log_softmax(logits, axis=-1)
-            per_sample_loss = -log_probs[jnp.arange(logits.shape[0]), labels_i]
-            keyframe_loss = jnp.mean(per_sample_loss)
-            probs = jax.nn.softmax(logits, axis=-1)
-            pred_score = jnp.sum(probs[:, 1:], axis=-1)
-            target_score = (labels_i > 0).astype(jnp.float32)
-            pred = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            acc = jnp.mean((pred == labels_i).astype(jnp.float32))
-            prob_mae = jnp.mean(jnp.abs(pred_score - target_score))
-            prob_mse = jnp.mean(jnp.square(pred_score - target_score))
-            return keyframe_loss, {
-                "keyframe_loss": keyframe_loss,
-                "keyframe_prob_mae": prob_mae,
-                "keyframe_mse": prob_mse,
-                "keyframe_acc": acc,
-            }
-
-        diff_state = nnx.DiffState(0, self._keyframe_filter)
-        (_, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model)
-        params = nnx.state(model).filter(self._keyframe_filter)
-        updates, self._keyframe_opt_state = self._tx.update(grads, self._keyframe_opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        nnx.update(model, new_params)
-        self._sync_compiled_state_from_model()
-        metrics = {
-            **metrics,
-            "keyframe_grad_norm": optax.global_norm(grads),
-        }
+    def _train_one_subtask_batch(self, obs_batch: dict[str, jnp.ndarray], labels: jnp.ndarray) -> dict[str, float]:
+        self._compiled_model_state, self._subtask_opt_state, metrics = self._train_subtask_step_jit(
+            self._compiled_model_state,
+            self._subtask_opt_state,
+            obs_batch,
+            labels,
+        )
+        nnx.update(self._model, self._compiled_model_state)
         return self._as_float_metrics(metrics)
 
     def train_mc_from_file(self, dataset_file: str) -> dict[str, float]:
@@ -1383,6 +1743,233 @@ class ValueMCService:
         log.info("train_keyframe_from_lerobot done metrics=%s", mean)
         return mean
 
+    def train_subtask_value_from_lerobot(
+        self,
+        *,
+        dataset_root: str,
+        repo_id: str,
+        subtask_annotations_json: str,
+    ) -> dict[str, float]:
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+        log.info(
+            "train_subtask_value_from_lerobot start dataset_root=%s repo_id=%s subtask_annotations_json=%s",
+            dataset_root,
+            repo_id,
+            subtask_annotations_json,
+        )
+        ensure_local_hf_cache()
+        ann_eps = _parse_subtask_annotations(subtask_annotations_json)
+        subtask_names = _load_subtask_names(subtask_annotations_json)
+        subtask_to_class = {name: idx + 1 for idx, name in enumerate(subtask_names)}
+        self._subtask_to_class = dict(subtask_to_class)
+        self._class_to_subtask = {idx: name for name, idx in subtask_to_class.items()}
+
+        ds = LeRobotDataset(repo_id=repo_id, root=dataset_root)
+        num_rows = len(ds)
+        if num_rows == 0:
+            log.info("train_subtask_value_from_lerobot empty dataset.")
+            return {"value_loss": 0.0, "value_mae": 0.0, "value_grad_norm": 0.0, "num_samples": 0.0}
+
+        ep_arr = np.zeros((num_rows,), dtype=np.int32)
+        fi_arr = np.zeros((num_rows,), dtype=np.int32)
+        task_index_arr = np.full((num_rows,), -1, dtype=np.int32)
+        task_name_by_idx: dict[int, str] = {}
+        for i in range(num_rows):
+            item = ds[i]
+            ep_arr[i] = int(np.asarray(item["episode_index"]).item())
+            fi_arr[i] = int(np.asarray(item["frame_index"]).item())
+            if "task_index" in item:
+                task_index_arr[i] = int(np.asarray(item["task_index"]).item())
+            else:
+                task_name_by_idx[i] = str(item.get("task", ""))
+
+        ep_to_indices: dict[int, list[int]] = {}
+        for i in range(num_rows):
+            ep_to_indices.setdefault(int(ep_arr[i]), []).append(i)
+
+        tasks = getattr(getattr(ds, "meta", None), "tasks", None)
+        clip_min = float(getattr(self._train_config.model, "value_bin_min", -1.0))
+        clip_max = float(getattr(self._train_config.model, "value_bin_max", 0.0))
+        c_fail_coef = float(self._value_c_fail_coef)
+        if c_fail_coef < 0:
+            raise ValueError("'value_c_fail_coef' must be non-negative.")
+        outcome_path = pathlib.Path(ds.root) / "meta" / "online_episode_outcomes.jsonl"
+        outcome_by_ep: dict[int, bool] = {}
+        if outcome_path.exists():
+            with outcome_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    outcome_by_ep[int(rec["episode_index"])] = self._resolve_success_bool(rec.get("success", False))
+
+        subtask_samples: list[SubtaskTrainSample] = []
+        for ep in sorted(ann_eps.keys()):
+            spans = ann_eps[ep]
+            if not spans:
+                continue
+            rows_ep = sorted(ep_to_indices.get(ep, []), key=lambda idx: int(fi_arr[idx]))
+            if not rows_ep:
+                log.warning("train_subtask_value_from_lerobot subtask annotation skipped: episode=%d not found in dataset", ep)
+                continue
+            row_by_frame = {int(fi_arr[idx]): int(idx) for idx in rows_ep}
+            episode_success = bool(outcome_by_ep.get(ep, False))
+            for span_idx, span in enumerate(spans):
+                subtask_rows: list[int] = []
+                for frame_idx in range(int(span.start), int(span.end) + 1):
+                    ds_idx = row_by_frame.get(frame_idx)
+                    if ds_idx is not None:
+                        subtask_rows.append(ds_idx)
+                if not subtask_rows:
+                    log.warning(
+                        "train_subtask_value_from_lerobot subtask annotation empty after frame lookup: episode=%d subtask=%s range=[%d,%d]",
+                        ep,
+                        span.name,
+                        span.start,
+                        span.end,
+                    )
+                    continue
+                subtask_len = len(subtask_rows)
+                subtask_success = bool(episode_success or span_idx < len(spans) - 1)
+                c_fail = float(max(1, subtask_len - 1))
+                denom = float(max(1, subtask_len - 1)) + (c_fail if not subtask_success else 0.0)
+                for pos, ds_idx in enumerate(subtask_rows):
+                    row = ds[int(ds_idx)]
+                    row_dict = {k: row[k] for k in row.keys()}
+                    base_prompt = _resolve_row_task_prompt(
+                        row_idx=int(ds_idx),
+                        row=row_dict,
+                        tasks=tasks,
+                        task_index_arr=task_index_arr,
+                        task_name_by_idx=task_name_by_idx,
+                    )
+                    subtask_prompt = _compose_subtask_prompt(base_prompt, span.name)
+                    remaining_steps = float(subtask_len - int(pos) - 1)
+                    g = -float(remaining_steps)
+                    if not subtask_success:
+                        g -= (c_fail_coef**remaining_steps) * c_fail
+                    target = float(np.clip(g / max(1e-6, denom), clip_min, clip_max))
+                    subtask_samples.append(
+                        SubtaskTrainSample(
+                            ds_index=int(ds_idx),
+                            subtask_name=span.name,
+                            subtask_prompt=subtask_prompt,
+                            target=target,
+                        )
+                    )
+
+        if not subtask_samples:
+            raise RuntimeError(
+                f"No subtask-conditioned value training samples were created from annotations: {subtask_annotations_json}"
+            )
+
+        input_transform = _build_input_transform(
+            self._train_config,
+            tasks=tasks,
+            checkpoint_dir=self._checkpoint_dir,
+            prompt_from_task=False,
+        )
+        subtask_cls_dataset = _LerobotSubtaskDataset(
+            ds,
+            input_transform,
+            ann_eps=ann_eps,
+            subtask_to_class=subtask_to_class,
+            ds_indices=np.asarray([sample.ds_index for sample in subtask_samples], dtype=np.int32),
+            prompt_overrides=[sample.subtask_prompt for sample in subtask_samples],
+        )
+        dataset = _LerobotTargetDataset(
+            ds,
+            input_transform,
+            np.asarray([sample.target for sample in subtask_samples], dtype=np.float32),
+            ds_indices=np.asarray([sample.ds_index for sample in subtask_samples], dtype=np.int32),
+            prompt_overrides=[sample.subtask_prompt for sample in subtask_samples],
+        )
+        train_sample_count = len(subtask_samples)
+        extra_metrics = {
+            "num_subtask_spans": float(sum(len(spans) for spans in ann_eps.values())),
+            "num_subtask_names": float(len(subtask_names)),
+        }
+
+        all_metrics: list[dict[str, float]] = []
+        total_steps = int(np.ceil(float(train_sample_count) / float(self._mc_batch_size)))
+        log.info(
+            "train_subtask_value_from_lerobot prepared_samples=%d subtask_names=%d epochs=%d batch_size=%d steps_per_epoch=%d",
+            train_sample_count,
+            len(subtask_names),
+            self._mc_epochs,
+            self._mc_batch_size,
+            total_steps,
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self._mc_batch_size,
+            shuffle=True,
+            num_workers=self._num_workers,
+            persistent_workers=self._persistent_workers,
+            multiprocessing_context=(multiprocessing.get_context("spawn") if self._num_workers > 0 else None),
+            worker_init_fn=_worker_init_fn if self._num_workers > 0 else None,
+            collate_fn=_collate_tree,
+            drop_last=False,
+        )
+        subtask_loader = torch.utils.data.DataLoader(
+            subtask_cls_dataset,
+            batch_size=self._keyframe_batch_size,
+            shuffle=True,
+            num_workers=self._num_workers,
+            persistent_workers=self._persistent_workers,
+            multiprocessing_context=(multiprocessing.get_context("spawn") if self._num_workers > 0 else None),
+            worker_init_fn=_worker_init_fn if self._num_workers > 0 else None,
+            collate_fn=_collate_tree,
+            drop_last=False,
+        )
+        for epoch in range(self._mc_epochs):
+            data_iter = iter(loader)
+            subtask_iter = iter(subtask_loader)
+            for step_i in range(1, total_steps + 1):
+                batch = next(data_iter)
+                batch_obs = self._batch_to_model_inputs(batch["obs"])
+                batch_ret = jnp.asarray(batch["target"], dtype=jnp.float32)
+                metrics = self._train_one_batch(batch_obs, batch_ret)
+                try:
+                    subtask_batch = next(subtask_iter)
+                except StopIteration:
+                    subtask_iter = iter(subtask_loader)
+                    subtask_batch = next(subtask_iter)
+                subtask_obs = self._batch_to_model_inputs(subtask_batch["obs"])
+                subtask_label = jnp.asarray(subtask_batch["target"], dtype=jnp.float32)
+                subtask_metrics = self._train_one_subtask_batch(subtask_obs, subtask_label)
+                metrics = {**metrics, **subtask_metrics}
+                all_metrics.append(metrics)
+                if self._should_log_step_timing(step_i, total_steps):
+                    log.info(
+                        "train_subtask_value_from_lerobot epoch=%d/%d step=%d/%d",
+                        epoch + 1,
+                        self._mc_epochs,
+                        step_i,
+                        total_steps,
+                    )
+                    self._log_step_metrics(
+                        "train_subtask_value_from_lerobot",
+                        epoch + 1,
+                        self._mc_epochs,
+                        step_i,
+                        total_steps,
+                        metrics,
+                    )
+
+        mean = {}
+        for k in all_metrics[0]:
+            mean[k] = float(np.mean([m[k] for m in all_metrics]))
+        mean["num_samples"] = float(train_sample_count)
+        mean.update(extra_metrics)
+        saved_to = self._autosave_after_train("train_subtask_value_from_lerobot")
+        if saved_to:
+            mean["saved_state_file"] = saved_to
+        log.info("train_subtask_value_from_lerobot done metrics=%s", mean)
+        return mean
+
 
 class ValueMCWebsocketServer:
     def __init__(self, *, host: str, port: int, service: ValueMCService):
@@ -1415,10 +2002,22 @@ class ValueMCWebsocketServer:
                         int(msg["phase_class"]),
                     )
                     resp = {"value": value}
+                elif cmd == "predict_subtask_value":
+                    value = self._service.predict_subtask_value(
+                        dict(msg["observation"]),
+                        int(msg["subtask_class"]),
+                    )
+                    resp = {"value": value}
                 elif cmd == "predict_phase_value_batch":
                     values = self._service.predict_phase_value_batch(
                         [dict(obs) for obs in msg["observations"]],
                         int(msg["phase_class"]),
+                    )
+                    resp = {"values": values}
+                elif cmd == "predict_subtask_value_batch":
+                    values = self._service.predict_subtask_value_batch(
+                        [dict(obs) for obs in msg["observations"]],
+                        int(msg["subtask_class"]),
                     )
                     resp = {"values": values}
                 elif cmd == "predict_keyframe":
@@ -1427,6 +2026,9 @@ class ValueMCWebsocketServer:
                 elif cmd == "predict_keyframe_class":
                     phase_class = self._service.predict_keyframe_class(dict(msg["observation"]))
                     resp = {"phase_class": phase_class}
+                elif cmd == "predict_subtask_class":
+                    subtask_class = self._service.predict_subtask_class(dict(msg["observation"]))
+                    resp = {"subtask_class": subtask_class}
                 elif cmd == "sync_params_from_file":
                     self._service.sync_params_from_file(str(msg["params_file"]))
                     resp = {"ok": True}
@@ -1459,6 +2061,13 @@ class ValueMCWebsocketServer:
                         dataset_root=str(msg["dataset_root"]),
                         repo_id=str(msg["repo_id"]),
                         annotations_json=str(msg["annotations_json"]),
+                    )
+                    resp = {"metrics": metrics}
+                elif cmd == "train_subtask_value_from_lerobot":
+                    metrics = self._service.train_subtask_value_from_lerobot(
+                        dataset_root=str(msg["dataset_root"]),
+                        repo_id=str(msg["repo_id"]),
+                        subtask_annotations_json=str(msg["subtask_annotations_json"]),
                     )
                     resp = {"metrics": metrics}
                 elif cmd == "train_value_and_keyframe_from_lerobot":

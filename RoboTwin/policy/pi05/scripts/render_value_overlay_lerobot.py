@@ -48,7 +48,9 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             fast_model_tokenizer_kwargs=base.fast_model_tokenizer_kwargs,
             use_value_head=True,
             use_keyframe_head=True,
+            use_subtask_head=True,
             keyframe_num_bins=KEYFRAME_NUM_BINS,
+            subtask_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     if hasattr(base, "pi05") and hasattr(base, "action_dim") and hasattr(base, "action_horizon"):
@@ -63,7 +65,9 @@ def _to_rl_train_config(cfg: train_config.TrainConfig) -> train_config.TrainConf
             discrete_state_input=base.discrete_state_input,
             use_value_head=True,
             use_keyframe_head=True,
+            use_subtask_head=True,
             keyframe_num_bins=KEYFRAME_NUM_BINS,
+            subtask_num_bins=KEYFRAME_NUM_BINS,
         )
         return dataclasses.replace(cfg, model=rl_model)
     raise TypeError(f"Config `{cfg.name}` is not compatible with value/keyframe overlay rendering.")
@@ -182,6 +186,57 @@ def _load_value_state(policy, state_file: str) -> None:
     policy.sync_model(nnx.merge(graphdef, state))
 
 
+def _normalize_name(raw: Any) -> str:
+    name = str(raw).strip()
+    if not name:
+        raise ValueError("Name must be non-empty.")
+    return name
+
+
+def _load_subtask_annotations(path: str | None) -> tuple[dict[int, list[dict[str, Any]]], dict[str, int]] | None:
+    if not path:
+        return None
+    raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    episodes_raw = raw.get("episodes", {})
+    if not isinstance(episodes_raw, dict):
+        raise ValueError("subtask_annotations_json must contain an `episodes` object.")
+    names_raw = raw.get("subtask_names", [])
+    if not isinstance(names_raw, list) or not names_raw:
+        raise ValueError("subtask_annotations_json must contain a non-empty `subtask_names` list.")
+    subtask_to_class = {_normalize_name(name): idx + 1 for idx, name in enumerate(names_raw)}
+    parsed: dict[int, list[dict[str, Any]]] = {}
+    for ep_key, spans_raw in episodes_raw.items():
+        ep = int(ep_key)
+        spans: list[dict[str, Any]] = []
+        if not isinstance(spans_raw, list):
+            raise ValueError(f"Episode {ep} subtasks must be a list.")
+        for item in spans_raw:
+            name = _normalize_name(item["name"])
+            spans.append(
+                {
+                    "name": name,
+                    "start": int(item["start"]),
+                    "end": int(item["end"]),
+                    "class": int(subtask_to_class[name]),
+                }
+            )
+        parsed[ep] = spans
+    return parsed, subtask_to_class
+
+
+def _lookup_subtask(
+    subtask_spans: list[dict[str, Any]] | None,
+    frame_idx: int,
+) -> tuple[int, str | None]:
+    if not subtask_spans:
+        return 0, None
+    fi = int(frame_idx)
+    for span in subtask_spans:
+        if int(span["start"]) <= fi <= int(span["end"]):
+            return int(span["class"]), str(span["name"])
+    return 0, None
+
+
 def _iter_batches(items: list[int], batch_size: int):
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
@@ -274,6 +329,33 @@ def _draw_series_chart(
         cv2.LINE_AA,
     )
     return canvas
+
+
+def _draw_discrete_series_chart(
+    values: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    current_index: int,
+    y_min: int,
+    y_max: int,
+    title: str,
+    line_color: tuple[int, int, int],
+    point_color: tuple[int, int, int],
+    value_label: str,
+) -> np.ndarray:
+    return _draw_series_chart(
+        values.astype(np.float32),
+        width=width,
+        height=height,
+        current_index=current_index,
+        y_min=float(y_min),
+        y_max=float(max(y_min + 1, y_max)),
+        title=title,
+        line_color=line_color,
+        point_color=point_color,
+        value_label=value_label,
+    )
 
 
 def _compute_axis_range(values: np.ndarray) -> tuple[float, float]:
@@ -376,11 +458,13 @@ def _render_episode_video(
     frames_hwc: list[np.ndarray],
     values: np.ndarray | None,
     keyframe_probs: np.ndarray | None,
+    subtask_classes: np.ndarray | None,
     fps: int,
     out_path: pathlib.Path,
     chart_height: int,
     show_value: bool,
     show_keyframe: bool,
+    show_subtask: bool,
 ) -> None:
     if not frames_hwc:
         raise ValueError(f"Episode {episode_index} has no frames.")
@@ -393,7 +477,7 @@ def _render_episode_video(
         fps=fps,
         frame_size=(width, height + chart_height),
     )
-    chart_panels = int(show_value) + int(show_keyframe)
+    chart_panels = int(show_value) + int(show_keyframe) + int(show_subtask)
     panel_heights = [chart_height // chart_panels] * chart_panels
     panel_heights[-1] += chart_height - sum(panel_heights)
     try:
@@ -435,6 +519,23 @@ def _render_episode_video(
                         value_label="p",
                     )
                 )
+                panel_idx += 1
+            if show_subtask:
+                assert subtask_classes is not None
+                charts.append(
+                    _draw_discrete_series_chart(
+                        subtask_classes,
+                        width=width,
+                        height=max(80, panel_heights[panel_idx]),
+                        current_index=i,
+                        y_min=0,
+                        y_max=int(np.max(subtask_classes)) if subtask_classes.size > 0 else 1,
+                        title="subtask_class",
+                        line_color=(180, 120, 60),
+                        point_color=(160, 80, 20),
+                        value_label="cls",
+                    )
+                )
             chart = charts[0] if len(charts) == 1 else np.concatenate(charts, axis=0)
             stacked = np.concatenate([frame, chart], axis=0)
             writer.write(stacked[:, :, ::-1])
@@ -451,10 +552,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--episodes", type=str, default="", help="Comma-separated episode indices. Empty means all.")
     p.add_argument("--value_state_file", type=str, default=None, help="Optional latest.pkl from serve_value_mc_ws.")
+    p.add_argument("--subtask_annotations_json", type=str, default=None)
     p.add_argument("--fps", type=int, default=0, help="Override fps. Default reads dataset meta/info.json.")
     p.add_argument("--chart_height", type=int, default=160)
     p.add_argument("--batch_size", type=int, default=8, help="Frames per inference batch.")
-    p.add_argument("--curves", type=str, default="both", choices=("both", "value", "keyframe"))
+    p.add_argument("--curves", type=str, default="both", choices=("both", "value", "keyframe", "subtask", "value_subtask", "all"))
     p.add_argument("--default_prompt", type=str, default="")
     return p.parse_args()
 
@@ -478,6 +580,7 @@ def main() -> None:
         _load_value_state(policy, args.value_state_file)
 
     dataset_root = pathlib.Path(args.dataset_root).resolve()
+    subtask_ann = _load_subtask_annotations(args.subtask_annotations_json)
     selected = _parse_episode_list(args.episodes)
     fps = int(args.fps) if int(args.fps) > 0 else _load_fps(dataset_root, 50)
     ds = LeRobotDataset(repo_id=args.repo_id, root=dataset_root, episodes=selected)
@@ -489,8 +592,9 @@ def main() -> None:
     if grouped is None:
         grouped = _group_episode_indices(ds)
     episode_ids = selected if selected is not None else sorted(grouped.keys())
-    show_value = args.curves in ("both", "value")
-    show_keyframe = args.curves in ("both", "keyframe")
+    show_value = args.curves in ("both", "value", "value_subtask", "all")
+    show_keyframe = args.curves in ("both", "keyframe", "all")
+    show_subtask = args.curves in ("subtask", "value_subtask", "all")
 
     out_dir = pathlib.Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -512,8 +616,10 @@ def main() -> None:
         frames_hwc: list[np.ndarray] = []
         values: list[float] = []
         keyframe_probs: list[float] = []
+        subtask_classes: list[int] = []
         frame_indices: list[int] = []
         ep_indices = grouped[ep]
+        ep_subtask_spans = None if subtask_ann is None else subtask_ann[0].get(int(ep), [])
         ep_start_time = time.time()
         print(
             json.dumps(
@@ -534,9 +640,16 @@ def main() -> None:
             for ds_idx in batch_indices:
                 item = ds[ds_idx]
                 obs = _build_obs(item, default_prompt=args.default_prompt)
+                frame_idx = int(_as_numpy(item["frame_index"]).item())
+                subtask_class, subtask_name = _lookup_subtask(ep_subtask_spans, frame_idx)
+                if show_value and subtask_name:
+                    obs = dict(obs)
+                    base_prompt = str(obs.get("prompt", "")).strip()
+                    obs["prompt"] = f"task: {base_prompt}; current subtask: {subtask_name}" if base_prompt else f"current subtask: {subtask_name}"
                 batch_obs.append(obs)
-                batch_frame_indices.append(int(_as_numpy(item["frame_index"]).item()))
+                batch_frame_indices.append(frame_idx)
                 batch_frames_hwc.append(_chw_to_hwc_uint8(obs["images"]["cam_high"]))
+                subtask_classes.append(int(subtask_class))
             if show_value:
                 values.extend(policy.predict_value_batch(batch_obs).tolist())
             if show_keyframe:
@@ -561,6 +674,7 @@ def main() -> None:
 
         values_arr = np.asarray(values, dtype=np.float32) if show_value else None
         keyframe_probs_arr = np.asarray(keyframe_probs, dtype=np.float32) if show_keyframe else None
+        subtask_classes_arr = np.asarray(subtask_classes, dtype=np.int32) if show_subtask else None
         out_video = out_dir / f"episode_{ep:06d}_value_overlay.mp4"
         print(
             json.dumps(
@@ -579,17 +693,20 @@ def main() -> None:
             frames_hwc=frames_hwc,
             values=values_arr,
             keyframe_probs=keyframe_probs_arr,
+            subtask_classes=subtask_classes_arr,
             fps=fps,
             out_path=out_video,
             chart_height=int(args.chart_height),
             show_value=show_value,
             show_keyframe=show_keyframe,
+            show_subtask=show_subtask,
         )
         summary["episodes"][str(ep)] = {
             "num_frames": int(len(frames_hwc)),
             "frame_indices": frame_indices,
             "values": [float(v) for v in values_arr.tolist()] if values_arr is not None else None,
             "keyframe_probs": [float(v) for v in keyframe_probs_arr.tolist()] if keyframe_probs_arr is not None else None,
+            "subtask_classes": [int(v) for v in subtask_classes_arr.tolist()] if subtask_classes_arr is not None else None,
             "video_path": str(out_video),
             "elapsed_sec": round(float(time.time() - ep_start_time), 2),
         }

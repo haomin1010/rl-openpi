@@ -277,6 +277,7 @@ class DimwiseDiagGaussianDCTPerturbNet:
         x_std: np.ndarray | None,
         dct_scale: float,
         action_delta_limit: float,
+        action_delta_limit_per_dim: np.ndarray | None,
         sigma_min: float,
         sigma_max: float,
         action_noise_dims: tuple[int, ...] | None,
@@ -298,7 +299,16 @@ class DimwiseDiagGaussianDCTPerturbNet:
         self.x_mean = np.asarray(x_mean, dtype=np.float32).reshape(1, -1) if x_mean is not None else None
         self.x_std = np.asarray(x_std, dtype=np.float32).reshape(1, -1) if x_std is not None else None
         self.dct_scale = float(dct_scale)
-        self.action_delta_limit = float(action_delta_limit)
+        self.action_delta_limit_per_dim = (
+            np.asarray(action_delta_limit_per_dim, dtype=np.float32).reshape(action_dim)
+            if action_delta_limit_per_dim is not None
+            else None
+        )
+        self.action_delta_limit = (
+            float(np.max(self.action_delta_limit_per_dim))
+            if self.action_delta_limit_per_dim is not None
+            else float(action_delta_limit)
+        )
         self.sigma_min = float(sigma_min)
         self.sigma_max = float(sigma_max)
         self.action_noise_dims = tuple(int(x) for x in action_noise_dims) if action_noise_dims is not None else None
@@ -319,6 +329,7 @@ class DimwiseDiagGaussianDCTPerturbNet:
         if not isinstance(layers, list) or len(layers) == 0:
             raise ValueError(f"Invalid layers in perturb net checkpoint `{path}`.")
         raw_noise_dims = meta.get("action_noise_dims")
+        raw_limit_per_dim = meta.get("action_delta_limit_per_dim")
         return cls(
             action_dim=int(meta["action_dim"]),
             chunk_size=int(meta["chunk_size"]),
@@ -331,6 +342,9 @@ class DimwiseDiagGaussianDCTPerturbNet:
             x_std=np.asarray(payload.get("x_std"), dtype=np.float32) if payload.get("x_std") is not None else None,
             dct_scale=float(meta.get("dct_scale", 1.0)),
             action_delta_limit=float(meta.get("action_delta_limit", 0.0)),
+            action_delta_limit_per_dim=(
+                np.asarray(raw_limit_per_dim, dtype=np.float32) if raw_limit_per_dim is not None else None
+            ),
             sigma_min=float(meta.get("sigma_min", 1e-4)),
             sigma_max=float(meta.get("sigma_max", 1.0)),
             action_noise_dims=tuple(int(x) for x in raw_noise_dims) if raw_noise_dims is not None else None,
@@ -396,10 +410,14 @@ class DimwiseDiagGaussianDCTPerturbNet:
         eps = np.random.normal(0.0, 1.0, size=sigma.shape).astype(np.float32)
         delta[:keep_k, allowed_dims] = sigma * eps
 
-        if self.action_delta_limit > 0:
+        if self.action_delta_limit_per_dim is not None or self.action_delta_limit > 0:
             dct_mat = _build_ortho_dct_matrix(self.chunk_size)
             delta_action = dct_mat.T @ (delta / max(self.dct_scale, 1e-6))
-            delta_action = np.clip(delta_action, -float(self.action_delta_limit), float(self.action_delta_limit))
+            if self.action_delta_limit_per_dim is not None:
+                clip = self.action_delta_limit_per_dim.reshape(1, self.action_dim)
+                delta_action = np.clip(delta_action, -clip, clip)
+            else:
+                delta_action = np.clip(delta_action, -float(self.action_delta_limit), float(self.action_delta_limit))
             delta = (dct_mat @ delta_action * float(self.dct_scale)).astype(np.float32)
         return np.asarray(delta, dtype=np.float32)
 

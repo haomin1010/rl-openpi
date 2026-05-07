@@ -21,6 +21,9 @@ class Pi0AuxConfig(pi0_config.Pi0Config):
     use_keyframe_head: bool = False
     keyframe_hidden_dim: int | None = None
     keyframe_num_bins: int | None = None
+    use_subtask_head: bool = False
+    subtask_hidden_dim: int | None = None
+    subtask_num_bins: int | None = None
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Aux":
@@ -47,6 +50,14 @@ class Pi0Aux(_pi0.Pi0):
             self.keyframe_head = nnx.Dict(
                 proj_in=nnx.Linear(paligemma_config.width, hidden_dim, rngs=rngs),
                 proj_out=nnx.Linear(hidden_dim, keyframe_num_bins, rngs=rngs),
+            )
+        self.subtask_head = None
+        if config.use_subtask_head:
+            hidden_dim = int(config.subtask_hidden_dim or paligemma_config.width)
+            subtask_num_bins = int(config.subtask_num_bins or max(2, config.action_horizon // 2))
+            self.subtask_head = nnx.Dict(
+                proj_in=nnx.Linear(paligemma_config.width, hidden_dim, rngs=rngs),
+                proj_out=nnx.Linear(hidden_dim, subtask_num_bins, rngs=rngs),
             )
 
     def _extract_aux_features(
@@ -132,6 +143,40 @@ class Pi0Aux(_pi0.Pi0):
         stop_gradient: bool = False,
     ) -> at.Int[at.Array, "b"]:
         logits = self.predict_keyframe_logits(observation, stop_gradient=stop_gradient)
+        return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+    def predict_subtask_logits(
+        self,
+        observation: _model.Observation,
+        *,
+        stop_gradient: bool = False,
+    ) -> at.Float[at.Array, "b bins"]:
+        if self.subtask_head is None:
+            raise ValueError("Subtask head is not enabled for this Pi0Aux model.")
+        _, subtask_features = self._extract_aux_features(observation, stop_gradient=stop_gradient)
+        hidden = self.subtask_head.proj_in(subtask_features)
+        hidden = jax.nn.gelu(hidden)
+        return self.subtask_head.proj_out(hidden)
+
+    def predict_subtask_prob(
+        self,
+        observation: _model.Observation,
+        *,
+        stop_gradient: bool = False,
+    ) -> at.Float[at.Array, "b"]:
+        logits = self.predict_subtask_logits(observation, stop_gradient=stop_gradient)
+        probs = jax.nn.softmax(logits, axis=-1)
+        if logits.shape[-1] == 2:
+            return probs[:, 1]
+        return jnp.sum(probs[:, 1:], axis=-1)
+
+    def predict_subtask_class(
+        self,
+        observation: _model.Observation,
+        *,
+        stop_gradient: bool = False,
+    ) -> at.Int[at.Array, "b"]:
+        logits = self.predict_subtask_logits(observation, stop_gradient=stop_gradient)
         return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
     def value_bin_centers(self) -> at.Float[at.Array, "bins"]:

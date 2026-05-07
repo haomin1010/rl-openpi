@@ -99,6 +99,20 @@ def _histogram_ratios(x: np.ndarray, edges: np.ndarray) -> dict[str, float]:
     return out
 
 
+def _seeded_sample_delta_dct(
+    net: DimwiseDiagGaussianDCTPerturbNet,
+    *,
+    dct_coeffs: np.ndarray,
+    seed: int,
+) -> np.ndarray:
+    state = np.random.get_state()
+    np.random.seed(int(seed))
+    try:
+        return net.sample_delta_dct(dct_coeffs=dct_coeffs)
+    finally:
+        np.random.set_state(state)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Analyze a trained dimwise sigma DCT perturbation network on LeRobot chunks.")
     p.add_argument("--dataset_root", type=str, required=True)
@@ -113,6 +127,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--num_samples_per_chunk", type=int, default=64)
     p.add_argument("--threshold", type=float, default=-1.0, help="Override action delta threshold. Default uses net.action_delta_limit.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--analyze_limit_ratio",
+        action="store_true",
+        help="Analyze |delta_action| / per-dim action_delta_limit ratio for new per-dim checkpoints.",
+    )
     p.add_argument("--out_json", type=str, default="")
     return p.parse_args()
 
@@ -197,14 +216,99 @@ def main() -> None:
         )
     dct_mat = _build_ortho_dct_matrix(chunk_size)
     dct_chunks = (np.einsum("tk,nta->nka", dct_mat, chunk_arr) * dct_scale).astype(np.float32)
+    num_samples = int(args.num_samples_per_chunk)
+    if num_samples <= 0:
+        raise ValueError("--num_samples_per_chunk must be > 0")
+
+    if args.analyze_limit_ratio:
+        if net.action_delta_limit_per_dim is None:
+            raise ValueError("--analyze_limit_ratio requires checkpoint metadata `action_delta_limit_per_dim`.")
+        limit_per_dim = np.asarray(net.action_delta_limit_per_dim, dtype=np.float32).reshape(1, 1, action_dim)
+        limit_per_dim = np.maximum(limit_per_dim, 1e-8)
+        ratio_edges = np.asarray([0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 0.95, 1.0], dtype=np.float64)
+        ratio_flat_all: list[np.ndarray] = []
+        ratio_dim_all: list[np.ndarray] = []
+        final_cumsum_ratio_all: list[np.ndarray] = []
+        rng = np.random.default_rng(int(args.seed))
+
+        for chunk_idx in range(chunk_arr.shape[0]):
+            coeffs = dct_chunks[chunk_idx]
+            for _ in range(num_samples):
+                delta_dct = _seeded_sample_delta_dct(net, dct_coeffs=coeffs, seed=int(rng.integers(0, 2**31 - 1)))
+                delta_action = dct_mat.T @ (delta_dct / max(float(net.dct_scale), 1e-6))
+                ratio = (np.abs(delta_action).astype(np.float32) / limit_per_dim[0]).astype(np.float32)
+                ratio_allowed = ratio[:, allowed_dims]
+                ratio_flat_all.append(ratio_allowed.reshape(-1))
+                ratio_dim_all.append(ratio_allowed)
+                final_cumsum = np.sum(delta_action[:, allowed_dims], axis=0, dtype=np.float64)
+                final_cumsum_ratio = np.abs(final_cumsum) / (
+                    np.asarray(net.action_delta_limit_per_dim, dtype=np.float64)[allowed_dims] * float(chunk_size)
+                )
+                final_cumsum_ratio_all.append(final_cumsum_ratio.astype(np.float32))
+
+        ratio_flat = np.concatenate(ratio_flat_all, axis=0) if ratio_flat_all else np.zeros((0,), dtype=np.float32)
+        ratio_dim = (
+            np.stack(ratio_dim_all, axis=0)
+            if ratio_dim_all
+            else np.zeros((0, chunk_size, len(allowed_dims)), dtype=np.float32)
+        )
+        final_cumsum_ratio = (
+            np.stack(final_cumsum_ratio_all, axis=0)
+            if final_cumsum_ratio_all
+            else np.zeros((0, len(allowed_dims)), dtype=np.float32)
+        )
+        summary = {
+            "net": str(pathlib.Path(args.net).resolve()),
+            "dataset_root": str(pathlib.Path(args.dataset_root).resolve()),
+            "repo_id": str(args.repo_id),
+            "chunk_size": int(chunk_size),
+            "action_dim": int(action_dim),
+            "allowed_dims": [int(x) for x in allowed_dims],
+            "num_chunks": int(chunk_arr.shape[0]),
+            "num_samples_per_chunk": int(num_samples),
+            "num_ratio_values": int(ratio_flat.size),
+            "limit_ratio_quantiles": _safe_quantiles(ratio_flat, [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]),
+            "limit_ratio_hist": _histogram_ratios(np.clip(ratio_flat, 0.0, 1.0), ratio_edges),
+            "limit_ratio_mean": float(np.mean(ratio_flat)) if ratio_flat.size > 0 else 0.0,
+            "near_limit_rate_90": float(np.mean(ratio_flat >= 0.9)) if ratio_flat.size > 0 else 0.0,
+            "near_limit_rate_95": float(np.mean(ratio_flat >= 0.95)) if ratio_flat.size > 0 else 0.0,
+            "clip_rate": float(np.mean(ratio_flat >= 0.999)) if ratio_flat.size > 0 else 0.0,
+            "final_cumsum_ratio_quantiles": _safe_quantiles(
+                final_cumsum_ratio.reshape(-1), [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+            ),
+            "final_cumsum_ratio_mean": float(np.mean(final_cumsum_ratio)) if final_cumsum_ratio.size > 0 else 0.0,
+            "per_dim_final_cumsum_ratio_mean": {
+                str(dim): float(np.mean(final_cumsum_ratio[:, i])) if final_cumsum_ratio.size > 0 else 0.0
+                for i, dim in enumerate(allowed_dims)
+            },
+            "per_dim_final_cumsum_ratio_p90": {
+                str(dim): float(np.quantile(final_cumsum_ratio[:, i], 0.9)) if final_cumsum_ratio.size > 0 else 0.0
+                for i, dim in enumerate(allowed_dims)
+            },
+            "per_dim_mean_ratio": {
+                str(dim): float(np.mean(ratio_dim[:, :, i])) if ratio_dim.size > 0 else 0.0
+                for i, dim in enumerate(allowed_dims)
+            },
+            "per_dim_p90_ratio": {
+                str(dim): float(np.quantile(ratio_dim[:, :, i], 0.9)) if ratio_dim.size > 0 else 0.0
+                for i, dim in enumerate(allowed_dims)
+            },
+            "per_dim_p99_ratio": {
+                str(dim): float(np.quantile(ratio_dim[:, :, i], 0.99)) if ratio_dim.size > 0 else 0.0
+                for i, dim in enumerate(allowed_dims)
+            },
+            "action_delta_limit_per_dim": np.asarray(net.action_delta_limit_per_dim, dtype=np.float32).tolist(),
+        }
+        print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
+        if args.out_json:
+            out_path = pathlib.Path(args.out_json).resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True), encoding="utf-8")
+        return
 
     threshold = float(args.threshold) if float(args.threshold) > 0 else float(net.action_delta_limit)
     if threshold <= 0:
         raise ValueError("Threshold must be > 0, either via --threshold or checkpoint action_delta_limit.")
-
-    num_samples = int(args.num_samples_per_chunk)
-    if num_samples <= 0:
-        raise ValueError("--num_samples_per_chunk must be > 0")
 
     pre_abs_all: list[np.ndarray] = []
     post_abs_all: list[np.ndarray] = []

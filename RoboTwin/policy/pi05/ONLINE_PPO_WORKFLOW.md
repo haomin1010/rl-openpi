@@ -66,7 +66,19 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
   --env.ws_url ws://127.0.0.1:8765 \
   --total_updates 1 \
-  --rollout_batch_size 1024 \
+  --rollout_batch_size 300 \
+  --mini_batch_size 32 \
+  --explore_mode never \
+  --ppo_epochs 0
+```
+
+```bash
+uv run python scripts/train_pi0_fast_online_v2.py \
+  --policy.path checkpoints/pi0_fast_aloha_robotwin_full_ee_delta/beat_block_hammer_pi0fast_full_ee_delta/30000/ \
+  --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
+  --env.ws_url ws://127.0.0.1:8765 \
+  --total_updates 1 \
+  --rollout_batch_size 300 \
   --mini_batch_size 32 \
   --explore_mode never \
   --ppo_epochs 0
@@ -191,7 +203,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/serve_value_mc_ws.py \
   --state_ckpt_dir /mnt/data1/tmp/pi05_value_state
 ```
 
-Equivalent `pi0_fast` `ee_delta` example:
+<!-- Equivalent `pi0_fast` `ee_delta` example:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python scripts/serve_value_mc_ws.py \
@@ -209,7 +221,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/serve_value_mc_ws.py \
   --value_target_mode evorl_normalized \
   --value_c_fail_coef 1.0 \
   --state_ckpt_dir /mnt/data1/tmp/pi05_value_state
-```
+``` -->
 
 Notes:
 
@@ -239,6 +251,67 @@ Current keyframe-head semantics:
 - class `0`: not inside any annotated keyphase
 - class `1..K`: inside the corresponding annotated phase
 - online `keyframe_prob` is interpreted as `P(class > 0)`
+
+### 2.3B New decoupled path: keyframe for exploration, subtask for value
+
+If you want:
+
+- `keyphases.json` to affect only PPO exploration gating
+- a separate `subtask_annotations.json` to define per-frame subtasks for value
+- value target to mean within-subtask progress rather than whole-phase success
+
+use this path instead.
+
+`keyphases.json`:
+
+- only trains the keyframe / phase classifier
+- only affects whether PPO exploration is enabled for a chunk
+
+`subtask_annotations.json`:
+
+- must cover every frame you want value supervision on
+- trains both:
+  - a `subtask head` that predicts the current subtask id
+  - a subtask-conditioned value head that predicts Evo-style progress within that subtask
+
+Recommended trigger sequence:
+
+Keyframe only:
+
+```bash
+uv run python scripts/trigger_keyframe_train_ws.py \
+  --ws_url ws://127.0.0.1:8877 \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json
+```
+
+Subtask-conditioned value only:
+
+```bash
+uv run python scripts/trigger_subtask_value_train_ws.py \
+  --ws_url ws://127.0.0.1:8877 \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --subtask_annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/subtask_annotations.json
+```
+
+Or trigger both in one command with separate annotation files:
+
+```bash
+uv run python scripts/trigger_keyframe_and_subtask_value_train_ws.py \
+  --ws_url ws://127.0.0.1:8877 \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --keyframe_annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
+  --subtask_annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/subtask_annotations.json
+```
+
+Chunk semantics in this path:
+
+- PPO exploration gate still uses chunk-start `phase_class`
+- value uses chunk-start `subtask_class`
+- one chunk is treated as belonging to a single subtask
 
 ### 2.4 Optional separate triggers
 
@@ -291,6 +364,9 @@ Use the overlay renderer to export per-episode videos with:
 - `--curves both`: top chart is value prediction, bottom chart is keyframe probability
 - `--curves value`: only render the value chart
 - `--curves keyframe`: only render the keyframe chart
+- `--curves subtask`: only render the subtask-class chart
+- `--curves value_subtask`: render subtask-conditioned value plus subtask class
+- `--curves all`: render value, keyframe probability, and subtask class together
 
 Recommended command after value/keyframe training:
 
@@ -305,6 +381,20 @@ uv run python scripts/render_value_overlay_lerobot.py \
   --out_dir /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/value_overlay
 ```
 
+Recommended command for the new decoupled path:
+
+```bash
+uv run python scripts/render_value_overlay_lerobot.py \
+  --policy.config pi05_aloha_full_base_ee \
+  --dataset_root /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus \
+  --repo_id lerobot_ppo_corpus \
+  --value_state_file /mnt/data1/tmp/pi05_value_state/latest.pkl \
+  --subtask_annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/subtask_annotations.json \
+  --curves value_subtask \
+  --episodes 0,1,2 \
+  --out_dir /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/subtask_value_overlay
+```
+
 ```bash
 uv run python scripts/render_keyframe_future_value_overlay.py \
   --policy.config pi05_aloha_full_base_ee \
@@ -312,7 +402,7 @@ uv run python scripts/render_keyframe_future_value_overlay.py \
   --repo_id lerobot_ppo_corpus \
   --annotations_json /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/keyphases.json \
   --value_state_file /mnt/data1/tmp/pi05_value_state_1/latest.pkl \
-  --episodes 0,1,2，100,101,105 \
+  --episodes 0,1,2,100,101,105 \
   --out_dir /mnt/data/lhm/vla-rl/RoboTwin/eval_result/lerobot_ppo_corpus/future_value_overlay
 ```
 
@@ -323,7 +413,8 @@ Notes:
 - `--policy.config` must match the backbone used when training the value/keyframe state.
 - `pi05_aloha_full_base_ee` does not require `--policy.path`.
 - Do not mix a `pi05` `latest.pkl` with a `pi0_fast` overlay policy, or vice versa.
-- `--curves` supports `both`, `value`, and `keyframe`.
+- `--curves` supports `both`, `value`, `keyframe`, `subtask`, `value_subtask`, and `all`.
+- When `--subtask_annotations_json` is provided, the renderer can overlay per-frame subtask class and uses the matching subtask prompt for value inference.
 - `--episodes` accepts a comma-separated episode list. Empty means render all episodes.
 - The script also writes a JSON summary file next to the rendered videos.
 
@@ -405,8 +496,8 @@ uv run python scripts/fit_exploration_net_nll_lerobot.py \
   --action_noise_dims "0,1,2,7,8,9" \
   --epochs 1 \
   --batch_size 2 \
-  --max_chunks 4 -->
-```
+  --max_chunks 4
+``` -->
 
 Dimwise sigma-network example:
 
@@ -418,7 +509,7 @@ uv run python scripts/fit_dimwise_sigma_net_lerobot.py \
   --out checkpoints/explored_net/dimwise_sigma_dct.pkl \
   --chunk_size 32 \
   --action_noise_dims "0,1,2,3,4,5" \
-  --action_delta_limit 0.1 \
+  --norm_stats_path assets/pi0_fast_aloha_robotwin_full_ee_delta/lerobot-hammer-clean-100-ee_delta/norm_stats.json \
   --noise_dct_keep_k 4 \
   --epochs 100 \
   --batch_size 128
@@ -508,10 +599,10 @@ uv run python scripts/train_pi0_fast_online_v2.py \
   --policy.path checkpoints/pi0_fast_aloha_robotwin_full_ee_delta/beat_block_hammer_pi0fast_full_ee_delta/30000/ \
   --policy.config pi0_fast_aloha_robotwin_ppo_ee_delta \
   --env.ws_url ws://127.0.0.1:8765 \
-  --total_updates 10 \
-  --buffer_capacity 1024 \
-  --mini_batch_size 4 \
-  --ppo_epochs 1 \
+  --total_updates 100 \
+  --buffer_capacity 64 \
+  --mini_batch_size 8 \
+  --ppo_epochs 4 \
   --value.ws_url ws://127.0.0.1:8877 \
   --explore_mode conditional_keyframe \
   --explore_keyframe_threshold 0.5 \

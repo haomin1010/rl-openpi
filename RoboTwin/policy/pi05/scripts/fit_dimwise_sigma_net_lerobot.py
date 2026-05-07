@@ -119,6 +119,37 @@ def _mlp_forward(params: list[dict[str, jnp.ndarray]], x: jnp.ndarray) -> jnp.nd
     return h
 
 
+def _load_action_delta_limit_per_dim(
+    norm_stats_path: str | None,
+    *,
+    action_dim: int,
+    fallback_scalar_limit: float,
+) -> np.ndarray:
+    if not norm_stats_path:
+        return np.full((action_dim,), float(fallback_scalar_limit), dtype=np.float32)
+
+    payload = json.loads(pathlib.Path(norm_stats_path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid norm stats json at `{norm_stats_path}`.")
+    norm_stats = payload.get("norm_stats", payload)
+    if not isinstance(norm_stats, dict):
+        raise ValueError(f"Invalid `norm_stats` structure at `{norm_stats_path}`.")
+    actions = norm_stats.get("actions")
+    if not isinstance(actions, dict):
+        raise ValueError(f"Missing `norm_stats.actions` in `{norm_stats_path}`.")
+    std = actions.get("std")
+    if std is None:
+        raise ValueError(f"Missing `norm_stats.actions.std` in `{norm_stats_path}`.")
+    std_arr = np.asarray(std, dtype=np.float32).reshape(-1)
+    if std_arr.shape[0] != int(action_dim):
+        raise ValueError(
+            f"norm_stats action dim mismatch: got {std_arr.shape[0]}, expected {action_dim} from dataset actions."
+        )
+    limit = std_arr / 10.0
+    limit = np.maximum(limit, 1e-6).astype(np.float32)
+    return limit
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train low-frequency/action-dim block sigma net in DCT space.")
     p.add_argument("--dataset_root", type=str, required=True)
@@ -145,18 +176,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sigma_min", type=float, default=1e-4)
     p.add_argument("--sigma_max", type=float, default=10.0)
     p.add_argument("--action_delta_limit", type=float, default=0.03)
-    p.add_argument("--constraint_margin", type=float, default=0.95)
-    p.add_argument("--constraint_coef", type=float, default=50.0)
     p.add_argument(
-        "--reward_scale_ratio",
+        "--norm_stats_path",
+        type=str,
+        default="",
+        help="Optional norm_stats.json path. If set, per-dim action delta limits use actions.std / 10.",
+    )
+    p.add_argument("--constraint_margin", type=float, default=0.95)
+    p.add_argument("--constraint_coef", type=float, default=0.01)
+    p.add_argument(
+        "--reward_target_ratio",
         type=float,
-        default=1.0,
-        help="Reward saturation scale as a ratio of action_delta_limit * constraint_margin.",
+        default=0.5,
+        help="Target per-step |delta_action| / threshold ratio for the quadratic reward.",
     )
     p.add_argument(
         "--penalty_power",
         type=float,
-        default=4.0,
+        default=2.0,
         help="Power used in the normalized soft constraint penalty. Must be >= 2.",
     )
     p.add_argument("--seed", type=int, default=0)
@@ -260,15 +297,25 @@ def main() -> None:
     sigma_min = float(args.sigma_min)
     sigma_max = float(args.sigma_max)
     delta_limit = float(args.action_delta_limit)
+    action_delta_limit_per_dim = _load_action_delta_limit_per_dim(
+        args.norm_stats_path,
+        action_dim=action_dim,
+        fallback_scalar_limit=delta_limit,
+    )
     margin = float(args.constraint_margin)
     constraint_coef = float(args.constraint_coef)
     penalty_power = max(2.0, float(args.penalty_power))
-    threshold = delta_limit * margin
-    if threshold <= 0:
-        raise ValueError("--action_delta_limit * --constraint_margin must be > 0")
-    reward_scale = max(1e-6, threshold * float(args.reward_scale_ratio))
+    threshold_per_dim = action_delta_limit_per_dim * margin
+    if np.any(threshold_per_dim <= 0):
+        raise ValueError("Per-dim action delta limit * --constraint_margin must be > 0")
+    reward_target_ratio = float(args.reward_target_ratio)
+    if reward_target_ratio <= 0:
+        raise ValueError("--reward_target_ratio must be > 0")
     allowed_dims_j = jnp.asarray(np.asarray(allowed_dims, dtype=np.int32))
     dct_shape = (effective_keep_k, len(allowed_dims))
+    threshold_j = jnp.asarray(threshold_per_dim.reshape(1, 1, action_dim), dtype=jnp.float32)
+    action_limit_j = jnp.asarray(action_delta_limit_per_dim.reshape(1, 1, action_dim), dtype=jnp.float32)
+    reward_target_ratio_j = jnp.asarray(reward_target_ratio, dtype=jnp.float32)
 
     @jax.jit
     def train_step(
@@ -287,22 +334,38 @@ def main() -> None:
             delta_sub = sigma * eps_noise.reshape((batch_x.shape[0],) + dct_shape)
             delta_dct = jnp.zeros((batch_x.shape[0], chunk_size, action_dim), dtype=jnp.float32)
             delta_dct = delta_dct.at[:, :effective_keep_k, allowed_dims_j].set(delta_sub)
-            delta_action = jnp.einsum("tk,bka->bta", dct_mat_inv, delta_dct / dct_scale_j)
-            per_step_abs = jnp.abs(delta_action)
-            violation = jax.nn.relu(per_step_abs - threshold)
-            penalty = jnp.mean((violation / threshold) ** penalty_power)
-            reward = jnp.mean(1.0 - jnp.exp(-per_step_abs / reward_scale))
+            delta_action_raw = jnp.einsum("tk,bka->bta", dct_mat_inv, delta_dct / dct_scale_j)
+            delta_action_exec = jnp.clip(delta_action_raw, -action_limit_j, action_limit_j)
+            per_step_abs_raw = jnp.abs(delta_action_raw)
+            per_step_abs_exec = jnp.abs(delta_action_exec)
+            per_step_abs_raw_sel = per_step_abs_raw[:, :, allowed_dims_j]
+            per_step_abs_exec_sel = per_step_abs_exec[:, :, allowed_dims_j]
+            threshold_sel = threshold_j[:, :, allowed_dims_j]
+            raw_ratio = per_step_abs_raw_sel / threshold_sel
+            exec_ratio = per_step_abs_exec_sel / threshold_sel
+            overshoot = jax.nn.relu(per_step_abs_raw_sel - threshold_sel)
+            penalty = jnp.mean((overshoot / threshold_sel) ** penalty_power)
+            reward = -jnp.mean((exec_ratio - reward_target_ratio_j) ** 2)
             loss = -reward + constraint_coef * penalty
             return loss, {
                 "loss": loss,
                 "reward": reward,
                 "penalty": penalty,
+                "raw_ratio_mean": jnp.mean(raw_ratio),
+                "raw_ratio_p50": jnp.quantile(raw_ratio.reshape(-1), 0.5),
+                "raw_ratio_p90": jnp.quantile(raw_ratio.reshape(-1), 0.9),
+                "raw_ratio_p95": jnp.quantile(raw_ratio.reshape(-1), 0.95),
+                "exec_ratio_mean": jnp.mean(exec_ratio),
+                "exec_ratio_p50": jnp.quantile(exec_ratio.reshape(-1), 0.5),
+                "exec_ratio_p90": jnp.quantile(exec_ratio.reshape(-1), 0.9),
+                "exec_ratio_p95": jnp.quantile(exec_ratio.reshape(-1), 0.95),
+                "clip_rate": jnp.mean(per_step_abs_raw_sel > action_limit_j[:, :, allowed_dims_j]),
                 "sigma_mean": jnp.mean(sigma),
-                "delta_abs_mean": jnp.mean(per_step_abs),
-                "delta_abs_max": jnp.max(per_step_abs),
-                "delta_abs_p95": jnp.quantile(per_step_abs.reshape(-1), 0.95),
-                "delta_abs_p99": jnp.quantile(per_step_abs.reshape(-1), 0.99),
-                "exceed_rate": jnp.mean(per_step_abs > threshold),
+                "delta_abs_mean": jnp.mean(per_step_abs_exec_sel),
+                "delta_abs_max": jnp.max(per_step_abs_exec_sel),
+                "delta_abs_p95": jnp.quantile(per_step_abs_exec_sel.reshape(-1), 0.95),
+                "delta_abs_p99": jnp.quantile(per_step_abs_exec_sel.reshape(-1), 0.99),
+                "exceed_rate": jnp.mean(per_step_abs_exec_sel > threshold_sel),
             }
 
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params_in)
@@ -330,6 +393,13 @@ def main() -> None:
         mean_metrics = {k: float(np.mean(v)) for k, v in metric_acc.items()}
         print(f"[epoch {epoch + 1}/{args.epochs}] {json.dumps(mean_metrics, ensure_ascii=True, sort_keys=True)}")
 
+    print(
+        "Per-dim action delta limits from norm stats std/10:"
+        if args.norm_stats_path
+        else "Per-dim action delta limits from scalar fallback:"
+    )
+    print(np.asarray(action_delta_limit_per_dim, dtype=np.float32).tolist())
+
     out = pathlib.Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     layers_payload: list[dict[str, np.ndarray]] = []
@@ -353,6 +423,9 @@ def main() -> None:
             "sigma_min": float(args.sigma_min),
             "sigma_max": float(args.sigma_max),
             "action_delta_limit": float(args.action_delta_limit),
+            "action_delta_limit_per_dim": np.asarray(action_delta_limit_per_dim, dtype=np.float32).tolist(),
+            "norm_stats_path": str(args.norm_stats_path or ""),
+            "reward_target_ratio": float(args.reward_target_ratio),
             "action_noise_dims": [int(x) for x in allowed_dims],
             "noise_dct_keep_k": int(effective_keep_k),
             "target_construction": "selected_dct_block_diag_gaussian_constraint",

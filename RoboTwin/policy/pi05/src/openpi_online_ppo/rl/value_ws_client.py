@@ -49,6 +49,16 @@ class ValueWebsocketClient:
         )
         return float(resp["value"])
 
+    def predict_subtask_value(self, obs: dict[str, Any], subtask_class: int) -> float:
+        resp = self._request(
+            {
+                "cmd": "predict_subtask_value",
+                "observation": obs,
+                "subtask_class": int(subtask_class),
+            }
+        )
+        return float(resp["value"])
+
     def predict_phase_value_batch(self, obs_batch: list[dict[str, Any]], phase_class: int) -> list[float]:
         resp = self._request(
             {
@@ -62,6 +72,19 @@ class ValueWebsocketClient:
             raise TypeError(f"Unexpected batch value response type: {type(values)}")
         return [float(v) for v in values]
 
+    def predict_subtask_value_batch(self, obs_batch: list[dict[str, Any]], subtask_class: int) -> list[float]:
+        resp = self._request(
+            {
+                "cmd": "predict_subtask_value_batch",
+                "observations": list(obs_batch),
+                "subtask_class": int(subtask_class),
+            }
+        )
+        values = resp.get("values", [])
+        if not isinstance(values, list):
+            raise TypeError(f"Unexpected batch subtask value response type: {type(values)}")
+        return [float(v) for v in values]
+
     def predict_keyframe(self, transformed_obs: dict[str, Any]) -> float:
         resp = self._request({"cmd": "predict_keyframe", "observation": transformed_obs})
         return float(resp["keyframe_prob"])
@@ -69,6 +92,10 @@ class ValueWebsocketClient:
     def predict_keyframe_class(self, transformed_obs: dict[str, Any]) -> int:
         resp = self._request({"cmd": "predict_keyframe_class", "observation": transformed_obs})
         return int(resp["phase_class"])
+
+    def predict_subtask_class(self, transformed_obs: dict[str, Any]) -> int:
+        resp = self._request({"cmd": "predict_subtask_class", "observation": transformed_obs})
+        return int(resp["subtask_class"])
 
     def sync_params_from_file(self, params_file: str) -> None:
         self._request({"cmd": "sync_params_from_file", "params_file": params_file})
@@ -136,6 +163,26 @@ class ValueWebsocketClient:
                 "dataset_root": dataset_root,
                 "repo_id": repo_id,
                 "annotations_json": annotations_json,
+            }
+        )
+        metrics = resp.get("metrics", {})
+        if not isinstance(metrics, dict):
+            return {}
+        return self._coerce_metrics(metrics)
+
+    def train_subtask_value_from_lerobot(
+        self,
+        *,
+        dataset_root: str,
+        repo_id: str,
+        subtask_annotations_json: str,
+    ) -> dict[str, Any]:
+        resp = self._request(
+            {
+                "cmd": "train_subtask_value_from_lerobot",
+                "dataset_root": dataset_root,
+                "repo_id": repo_id,
+                "subtask_annotations_json": subtask_annotations_json,
             }
         )
         metrics = resp.get("metrics", {})

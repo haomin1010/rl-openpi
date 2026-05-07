@@ -124,8 +124,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--explore_network_ckpt", type=str, default=None)
     p.add_argument("--explore_network_obs_dim", type=int, default=32)
     p.add_argument("--explore_network_latent_dim", type=int, default=16)
-    p.add_argument("--explored_chunk_weight", type=float, default=1.0)
+    p.add_argument("--explored_chunk_weight", type=float, default=1.5)
     p.add_argument("--non_explored_chunk_weight", type=float, default=1.0)
+    p.add_argument(
+        "--explore_phase_ids",
+        type=str,
+        default="",
+        help="Comma-separated phase ids that are allowed to explore. Empty means legacy behavior: all phase_class > 0.",
+    )
     p.add_argument("--value.ws_url", dest="value_ws_url", type=str, default=None)
     p.add_argument("--timing_log_file", type=str, default=None)
     return p.parse_args()
@@ -231,6 +237,7 @@ def main() -> None:
                     "total_updates": int(args.total_updates),
                     "explore_mode": str(args.explore_mode),
                     "explore_perturb_backend": str(args.explore_perturb_backend),
+                    "explore_phase_ids": str(args.explore_phase_ids),
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -331,6 +338,7 @@ def main() -> None:
         value_predictor=value_client,
         compute_values=not collect_only,
         include_logprobs=not collect_only,
+        explore_phase_ids=_parse_dim_list(args.explore_phase_ids),
     )
     completed = False
     try:
